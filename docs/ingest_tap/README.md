@@ -44,6 +44,8 @@ ingest_tap --nats nats://localhost:4222 --icao A12345
 
 **ingest_tap subscribes**: Receives real-time feed
 
+**Keeps its tap open**: Each pipeline instance drops a tap condition 5 minutes after its last `add`, so `ingest_tap` repeats its `add` every minute. On exit it stops refreshing, waits for any refresh in flight, then sends `remove`. If it is killed, the tap expires on its own within 5 minutes.
+
 **No impact**: Read-only monitoring (doesn't affect pipeline)
 
 ## See Also

@@ -213,6 +213,25 @@ if msg.Header.Get("type") != "beast" {
 ```
 
 **Header overhead**: ~50-100 bytes
+
+### Publish a Prepared Message
+
+**For hot paths** that publish many messages with the same headers:
+```go
+msg := nats.NewMsg("")
+msg.Header["type"] = []string{"beast"}
+for _, frame := range frames {
+    msg.Subject = subject
+    msg.Data = frame
+    if err := server.PublishMsg(msg); err != nil {
+        // count or rate-limit the log yourself
+    }
+}
+```
+
+**Why**: `PublishWithHeaders` builds a new `nats.Msg` and header map per call. `PublishMsg` takes a message you built once; nats.go encodes it before returning, so you can change and reuse it (and its `Header` and `Data`) straight away.
+
+**Errors are not logged**: unlike `Publish` and `PublishWithHeaders`, `PublishMsg` returns errors without logging them, so a caller publishing every frame can avoid a log line per frame while NATS reconnects. The IngestTap middleware uses it this way.
 - Negligible for large payloads (KB+)
 - Matters for tiny payloads (<100 bytes)
 

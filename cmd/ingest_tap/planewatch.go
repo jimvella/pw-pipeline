@@ -19,6 +19,10 @@ import (
 const (
 	tapActionAdd    = "add"
 	tapActionRemove = "remove"
+
+	// tapRefreshInterval keeps our taps alive: each ingest drops a condition not
+	// re-added within middleware.TapConditionExpiry.
+	tapRefreshInterval = time.Minute
 )
 
 type (
@@ -29,7 +33,11 @@ type (
 		wsLow, wsHigh *ws_protocol.WsClient
 
 		exitChannels map[string]chan bool
-		taps         []tapHeaders
+		taps         []tapHeaders // append and read under mu; the maps are never changed once added (tapList hands out copies)
+
+		refreshStart, refreshStopOnce sync.Once
+		refreshStop                   chan struct{}
+		refreshWg                     sync.WaitGroup // Disconnect waits for refreshTaps to exit
 
 		logger zerolog.Logger
 
@@ -59,6 +67,7 @@ func NewPlaneWatchTapper(opts ...Option) *PlaneWatchTapper {
 	pw := &PlaneWatchTapper{
 		exitChannels:               make(map[string]chan bool),
 		taps:                       make([]tapHeaders, 0),
+		refreshStop:                make(chan struct{}),
 		logger:                     zerolog.Logger{},
 		queueLocations:             sink.QueueLocationUpdates,
 		queueLocationsEnriched:     "location-updates-enriched",
@@ -109,8 +118,12 @@ func (pw *PlaneWatchTapper) Connect(natsServer, wsServer string) error {
 }
 
 func (pw *PlaneWatchTapper) Disconnect() {
+	// Stop refreshing, and wait for any refresh in flight, so no "add" lands after our "remove".
+	pw.refreshStopOnce.Do(func() { close(pw.refreshStop) })
+	pw.refreshWg.Wait()
+
 	// request things stop sending
-	for _, tapName := range pw.taps {
+	for _, tapName := range pw.tapList(tapActionRemove) {
 		pw.RemoveIncomingTap(tapName)
 	}
 
@@ -161,9 +174,51 @@ func (pw *PlaneWatchTapper) IncomingDataTap(icao, feederKey string, writer Inges
 		return errRq
 	}
 	pw.logger.Debug().Str("response", string(response)).Msg("request response")
+	pw.mu.Lock()
 	pw.taps = append(pw.taps, headers)
+	pw.mu.Unlock()
+	pw.refreshStart.Do(func() {
+		pw.refreshWg.Add(1)
+		go pw.refreshTaps()
+	})
 
 	return nil
+}
+
+// tapList returns a copy of every tap's headers with the given action.
+func (pw *PlaneWatchTapper) tapList(action string) []tapHeaders {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	taps := make([]tapHeaders, 0, len(pw.taps))
+	for _, tap := range pw.taps {
+		c := make(tapHeaders, len(tap))
+		for k, v := range tap {
+			c[k] = v
+		}
+		c["action"] = action
+		taps = append(taps, c)
+	}
+	return taps
+}
+
+// refreshTaps repeats each tap's "add" until Disconnect, so the ingests keep it,
+// and so ingests started after the first request get it too.
+func (pw *PlaneWatchTapper) refreshTaps() {
+	defer pw.refreshWg.Done()
+	ticker := time.NewTicker(tapRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-pw.refreshStop:
+			return
+		case <-ticker.C:
+		}
+		for _, tap := range pw.tapList(tapActionAdd) {
+			if _, err := pw.natsSvr.Request(middleware.NatsAPIv1PwIngestTap, []byte{}, tap, time.Second); err != nil {
+				pw.logger.Warn().Err(err).Msg("Failed to refresh natsTap")
+			}
+		}
+	}
 }
 
 func (pw *PlaneWatchTapper) RemoveIncomingTap(tap tapHeaders) {

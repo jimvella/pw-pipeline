@@ -1,264 +1,395 @@
 package middleware
 
 import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"plane.watch/lib/tracker"
+	"plane.watch/lib/tracker/beast"
+	"plane.watch/lib/tracker/sbs1"
 )
 
-func TestLinkedListAddTest(t *testing.T) {
-	tap := IngestTap{}
-	if nil != tap.head {
-		t.Errorf("Zero value of IngestTap has a non nil head")
-		return
-	}
-	if nil != tap.tail {
-		t.Errorf("Zero value of IngestTap has a non nil tail")
-		return
-	}
+var (
+	// DF17 from 7C49F8 and from 48FC83, as the Beast producer emits them.
+	tapBeast7C49F8 = []byte{0x1a, 0x33, 0x22, 0x1b, 0x54, 0xac, 0xc2, 0xe9, 0x28, 0x8d, 0x7c, 0x49, 0xf8, 0x58, 0x41, 0xd2, 0x6c, 0xca, 0x39, 0x33, 0xe4, 0x1e, 0xcf}
+	tapBeast48FC83 = []byte{0x1A, 0x33, 0x14, 0x93, 0xFF, 0x2D, 0xD3, 0xC7, 0x62, 0x8D, 0x48, 0xFC, 0x83, 0x1C, 0x4D, 0x04, 0xCD, 0x14, 0x48, 0x20, 0x72, 0x37, 0xC3}
+)
 
-	cond1 := &condition{}
-	cond2 := &condition{}
-	cond3 := &condition{}
+type (
+	published struct {
+		subject, typ, tag string
+		data              []byte
+	}
+	recordingPublisher struct {
+		mu   sync.Mutex
+		msgs []published
+	}
+)
 
-	///////// First item
-	tap.append(cond1)
-	if cond1 != tap.head {
-		t.Errorf("Failed to set tap.head to our newly added item")
-		return
-	}
-	if cond1 != tap.tail {
-		t.Errorf("Failed to set tap.tail to our newly added item")
-		return
-	}
+func (p *recordingPublisher) PublishMsg(m *nats.Msg) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.msgs = append(p.msgs, published{
+		subject: m.Subject,
+		typ:     m.Header.Get("type"),
+		tag:     m.Header.Get("tag"),
+		data:    bytes.Clone(m.Data),
+	})
+	return nil
+}
 
-	///////// Second item
-	tap.append(cond2)
-	if cond1 != tap.head {
-		t.Errorf("Failed to set tap.head to our newly added second item")
-		return
-	}
-	if cond2 != tap.tail {
-		t.Errorf("Failed to set tap.tail to our newly added second item")
-		return
-	}
-	if nil != cond1.prevItem {
-		t.Errorf("Somehow the tap.head has a previous item")
-		return
-	}
+func (p *recordingPublisher) all() []published {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]published(nil), p.msgs...)
+}
 
-	if cond2 != cond1.nextItem {
-		t.Errorf("Did not correctly set cond2 as cond1's next item")
-		return
+func beastEvent(t *testing.T, raw []byte, tag string) (*beast.Frame, tracker.FrameEvent) {
+	t.Helper()
+	f, err := beast.NewFrame(bytes.Clone(raw), false)
+	if err != nil {
+		t.Fatalf("NewFrame: %v", err)
 	}
-	if cond2.prevItem != cond1 {
-		t.Errorf("Did not correctly set cond2's prevItem to be cond1")
-		return
+	if err = f.Decode(); err != nil {
+		t.Fatalf("Decode: %v", err)
 	}
+	return f, tracker.NewFrameEvent(f, &tracker.FrameSource{Tag: tag})
+}
 
-	///////// Third item
-	tap.append(cond3)
-	if cond3 != tap.tail {
-		t.Errorf("Failed to set tap.tail to our newly added third item")
-		return
-	}
-	if cond3 != cond2.nextItem {
-		t.Errorf("Failed to set cond2's nextItem to our newly added third item")
-		return
-	}
-	if cond2 != cond3.prevItem {
-		t.Errorf("Failed to set cond3's prevItem to our second item")
-		return
-	}
+// drain starts one worker on a tap built with none, and waits for it to empty the queue.
+func drain(tap *IngestTap) {
+	tap.queueWg.Add(1)
+	go tap.processQueue()
+	tap.Stop()
+}
 
-	if tap.head != cond1 || cond1.nextItem != cond2 {
-		t.Errorf("cond1 is not setup correctly after adding third item")
+func conditionCount(tap *IngestTap) int {
+	set := tap.conds.Load()
+	n := len(set.anyTag)
+	for _, cs := range set.byTag {
+		n += len(cs)
+	}
+	return n
+}
+
+func TestTapIdleSendsNothing(t *testing.T) {
+	pub := &recordingPublisher{}
+	tap := newIngestTap(pub, 0)
+	_, fe := beastEvent(t, tapBeast7C49F8, "feeder-a")
+	if got := tap.Handle(&fe); got != fe.Frame() {
+		t.Errorf("Handle must return the frame unchanged")
+	}
+	if len(tap.queue) != 0 {
+		t.Errorf("idle tap queued %d frames", len(tap.queue))
+	}
+	drain(tap)
+	if n := len(pub.all()); n != 0 {
+		t.Errorf("idle tap published %d frames", n)
 	}
 }
 
-func TestLinkedListAddRemoveNone(t *testing.T) {
-	tap := IngestTap{}
-	if nil != tap.head {
-		t.Errorf("Zero value of IngestTap has a non nil head")
-		return
+func TestTapRepeatedAddIsIdempotent(t *testing.T) {
+	pub := &recordingPublisher{}
+	tap := newIngestTap(pub, 0)
+	c := condition{subject: "out"}
+	if !tap.add(c) {
+		t.Errorf("first add should report a new condition")
 	}
-	if nil != tap.tail {
-		t.Errorf("Zero value of IngestTap has a non nil tail")
-		return
+	for i := 0; i < 59; i++ {
+		if tap.add(c) {
+			t.Fatalf("repeat add %d reported a new condition", i)
+		}
 	}
-
-	cond1 := &condition{apiKey: "1"}
-	cond2 := &condition{apiKey: "2"}
-	cond3 := &condition{apiKey: "3"}
-	cond4 := &condition{apiKey: "4"}
-
-	tap.append(cond1)
-	tap.append(cond2)
-	tap.append(cond3)
-
-	tap.remove(cond4)
-
-	///////// Third item
-	if tap.head != cond1 {
-		t.Errorf("tap.head != cond1")
-		return
+	if n := conditionCount(tap); n != 1 {
+		t.Fatalf("conditions = %d, want 1", n)
 	}
-	if nil != cond1.prevItem {
-		t.Errorf("nil != cond1.prevItem")
-		return
-	}
-	if cond1.nextItem != cond2 {
-		t.Errorf("cond1.nextItem != cond2")
-		return
-	}
-	if cond2.prevItem != cond1 {
-		t.Errorf("cond2.prevItem != cond1")
-		return
-	}
-	if cond2.nextItem != cond3 {
-		t.Errorf("cond2.nextItem != cond3")
-		return
-	}
-	if cond3.prevItem != cond2 {
-		t.Errorf("cond3.prevItem != cond2")
-		return
-	}
-	if cond3.nextItem != nil {
-		t.Errorf("cond3.nextItem != nil")
-		return
-	}
-
-}
-
-func TestLinkedListAddRemoveHead(t *testing.T) {
-	tap := IngestTap{}
-	if nil != tap.head {
-		t.Errorf("Zero value of IngestTap has a non nil head")
-		return
-	}
-	if nil != tap.tail {
-		t.Errorf("Zero value of IngestTap has a non nil tail")
-		return
-	}
-
-	cond1 := &condition{apiKey: "1"}
-	cond2 := &condition{apiKey: "2"}
-	cond3 := &condition{apiKey: "3"}
-
-	tap.append(cond1)
-	tap.append(cond2)
-	tap.append(cond3)
-
-	tap.remove(cond1)
-
-	if nil != cond1.nextItem || nil != cond1.prevItem {
-		t.Errorf("Failed to unset next/prev on cond1")
-		return
-	}
-
-	if cond2 != tap.head {
-		t.Errorf("After removal of head, cond2 should be tap.head")
-		return
-	}
-
-	if cond2.prevItem != nil {
-		t.Errorf("tap.head has a prev item")
-		return
-	}
-
-	if cond2.nextItem != cond3 {
-		t.Errorf("cond2.next item should be cond3")
-		return
-	}
-
-}
-
-func TestLinkedListAddRemoveMiddle(t *testing.T) {
-	tap := IngestTap{}
-	if nil != tap.head {
-		t.Errorf("Zero value of IngestTap has a non nil head")
-		return
-	}
-	if nil != tap.tail {
-		t.Errorf("Zero value of IngestTap has a non nil tail")
-		return
-	}
-
-	cond1 := &condition{apiKey: "1"}
-	cond2 := &condition{apiKey: "2"}
-	cond3 := &condition{apiKey: "3"}
-
-	tap.append(cond1)
-	tap.append(cond2)
-	tap.append(cond3)
-
-	tap.remove(cond2)
-
-	if nil != cond2.nextItem || nil != cond2.prevItem {
-		t.Errorf("Failed to unset next/prev on cond2")
-		return
-	}
-
-	if tap.head != cond1 {
-		t.Errorf("tap.head should be cond1")
-		return
-	}
-	if tap.tail != cond3 {
-		t.Errorf("tap.tail should be cond3")
-		return
-	}
-	if cond1.nextItem != cond3 {
-		t.Errorf("cond1.nextItem should be cond3")
-		return
-	}
-	if cond3.prevItem != cond1 {
-		t.Errorf("cond3.prevItem should be cond1")
-		return
-	}
-	if nil != cond3.nextItem {
-		t.Errorf("cond3.nextItem should be nil")
-		return
-	}
-	if nil != cond1.prevItem {
-		t.Errorf("cond1.prevItem should be nil")
-		return
+	_, fe := beastEvent(t, tapBeast7C49F8, "feeder-a")
+	tap.Handle(&fe)
+	drain(tap)
+	if n := len(pub.all()); n != 1 {
+		t.Errorf("published %d copies, want 1", n)
 	}
 }
 
-func TestLinkedListAddRemoveTail(t *testing.T) {
-	tap := IngestTap{}
-	if nil != tap.head {
-		t.Errorf("Zero value of IngestTap has a non nil head")
-		return
+func TestTapRemove(t *testing.T) {
+	tap := newIngestTap(&recordingPublisher{}, 0)
+	defer tap.Stop()
+	a := condition{subject: "out", apiKey: "a"}
+	b := condition{subject: "out", apiKey: "b"}
+	c := condition{subject: "out"}
+	tap.add(a)
+	tap.add(b)
+	tap.add(c)
+	if !tap.remove(b) {
+		t.Errorf("remove of a present condition should report true")
 	}
-	if nil != tap.tail {
-		t.Errorf("Zero value of IngestTap has a non nil tail")
-		return
+	if tap.remove(b) {
+		t.Errorf("second remove should report false")
+	}
+	if n := conditionCount(tap); n != 2 {
+		t.Fatalf("conditions = %d, want 2", n)
+	}
+	set := tap.conds.Load()
+	if len(set.byTag["b"]) != 0 || len(set.byTag["a"]) != 1 || len(set.anyTag) != 1 {
+		t.Errorf("wrong conditions left after remove: %+v", set)
+	}
+	tap.remove(a)
+	tap.remove(c)
+	if !tap.conds.Load().empty() {
+		t.Errorf("tap should be idle after removing every condition")
+	}
+}
+
+func TestTapFiltersBeforeQueuing(t *testing.T) {
+	tap := newIngestTap(&recordingPublisher{}, 0)
+	tap.add(condition{subject: "out", apiKey: "wanted"})
+
+	// Far more unwanted frames than the queue holds: none may be queued.
+	for i := 0; i < 5*tapQueueLen; i++ {
+		_, fe := beastEvent(t, tapBeast7C49F8, "other")
+		tap.Handle(&fe)
+	}
+	if len(tap.queue) != 0 {
+		t.Fatalf("queued %d frames that match no condition", len(tap.queue))
+	}
+	_, fe := beastEvent(t, tapBeast7C49F8, "wanted")
+	tap.Handle(&fe)
+	if len(tap.queue) != 1 {
+		t.Errorf("matching frame not queued")
+	}
+	tap.Stop()
+}
+
+func TestTapIcaoFilter(t *testing.T) {
+	pub := &recordingPublisher{}
+	tap := newIngestTap(pub, 0)
+	tap.add(condition{subject: "out", icao: 0x48FC83})
+	_, fe1 := beastEvent(t, tapBeast7C49F8, "a")
+	_, fe2 := beastEvent(t, tapBeast48FC83, "a")
+	tap.Handle(&fe1)
+	tap.Handle(&fe2)
+	drain(tap)
+	msgs := pub.all()
+	if len(msgs) != 1 || !bytes.Equal(msgs[0].data, tapBeast48FC83) {
+		t.Errorf("icao filter sent %d frames, want only 48FC83's", len(msgs))
+	}
+}
+
+func TestTapFullQueueDoesNotBlock(t *testing.T) {
+	tap := newIngestTap(&recordingPublisher{}, 0) // no workers, so the queue fills
+	tap.add(condition{subject: "out"})
+	for i := 0; i < tapQueueLen+7; i++ {
+		_, fe := beastEvent(t, tapBeast7C49F8, "a")
+		tap.Handle(&fe) // would hang here if a full queue blocked the pipeline
+	}
+	if len(tap.queue) != tapQueueLen {
+		t.Errorf("queue holds %d frames, want %d", len(tap.queue), tapQueueLen)
+	}
+	tap.Stop()
+}
+
+func TestTapCopiesPooledBeastFrame(t *testing.T) {
+	beast.UsePoolAllocator = true
+	defer func() { beast.UsePoolAllocator = false }()
+
+	pub := &recordingPublisher{}
+	tap := newIngestTap(pub, 0)
+	tap.add(condition{subject: "out"})
+
+	f, fe := beastEvent(t, tapBeast7C49F8, "feeder-a")
+	tap.Handle(&fe)
+	// What the tracker does after the middleware: release the frame, which zeroes its
+	// bytes, and reuse it for the next message.
+	beast.Release(f)
+	for i := 0; i < 10; i++ {
+		_, _ = beastEvent(t, tapBeast48FC83, "feeder-b")
+	}
+	drain(tap)
+
+	msgs := pub.all()
+	if len(msgs) != 1 {
+		t.Fatalf("published %d frames, want 1", len(msgs))
+	}
+	m := msgs[0]
+	if !bytes.Equal(m.data, tapBeast7C49F8) {
+		t.Errorf("published % X, want the frame as it was when handled % X", m.data, tapBeast7C49F8)
+	}
+	if m.subject != "out" || m.typ != "beast" || m.tag != "feeder-a" {
+		t.Errorf("got subject %q type %q tag %q", m.subject, m.typ, m.tag)
+	}
+}
+
+func TestTapSbs1Frame(t *testing.T) {
+	pub := &recordingPublisher{}
+	tap := newIngestTap(pub, 0)
+	tap.add(condition{subject: "out", apiKey: "mlat-mux"})
+	line := "MSG,3,1,1,7C6DB8,1,2026/10/25,01:02:03.456,2026/10/25,01:02:04.000,,3400,,,-31.950000,115.860000,,,,,,"
+	f := sbs1.NewFrame(line)
+	if err := f.Decode(); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	fe := tracker.NewFrameEvent(f, &tracker.FrameSource{Tag: "mlat-mux"})
+	tap.Handle(&fe)
+	drain(tap)
+	msgs := pub.all()
+	if len(msgs) != 1 || string(msgs[0].data) != line || msgs[0].typ != "sbs1" {
+		t.Errorf("got %+v", msgs)
+	}
+}
+
+func TestTapExpiry(t *testing.T) {
+	tap := newIngestTap(&recordingPublisher{}, 0)
+	defer tap.Stop()
+	t0 := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)
+	now := t0
+	tap.now = func() time.Time { return now }
+
+	stale := condition{subject: "stale"}
+	kept := condition{subject: "kept"}
+	tap.add(stale)
+	tap.add(kept)
+
+	now = t0.Add(3 * time.Minute)
+	tap.add(kept) // refresh
+	now = t0.Add(TapConditionExpiry - time.Second)
+	tap.expire()
+	if n := conditionCount(tap); n != 2 {
+		t.Fatalf("conditions = %d before expiry, want 2", n)
 	}
 
-	cond1 := &condition{apiKey: "1"}
-	cond2 := &condition{apiKey: "2"}
-	cond3 := &condition{apiKey: "3"}
-
-	tap.append(cond1)
-	tap.append(cond2)
-	tap.append(cond3)
-
-	tap.remove(cond3)
-
-	if nil != cond3.nextItem || nil != cond3.prevItem {
-		t.Errorf("Failed to unset next/prev on cond3")
-		return
+	now = t0.Add(TapConditionExpiry)
+	tap.expire()
+	set := tap.conds.Load()
+	if len(set.anyTag) != 1 || set.anyTag[0] != kept {
+		t.Fatalf("after expiry got %+v, want only the refreshed condition", set.anyTag)
 	}
 
-	if cond2 != tap.tail {
-		t.Errorf("tap.tail should be cond2")
+	now = t0.Add(3*time.Minute + TapConditionExpiry)
+	tap.expire()
+	if !tap.conds.Load().empty() {
+		t.Errorf("refreshed condition should expire 5 minutes after its last add")
 	}
-	if cond1 != tap.head {
-		t.Errorf("tap.head should be cond1")
+}
+
+func tapRequest(action, subject, apiKey, icao string) *nats.Msg {
+	m := nats.NewMsg(NatsAPIv1PwIngestTap)
+	m.Header.Set("action", action)
+	m.Header.Set("subject", subject)
+	m.Header.Set("api-key", apiKey)
+	m.Header.Set("icao", icao)
+	return m
+}
+
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	old := log.Logger
+	log.Logger = zerolog.New(zerolog.SyncWriter(buf)).Level(zerolog.DebugLevel)
+	t.Cleanup(func() { log.Logger = old })
+	return buf
+}
+
+func logLevels(t *testing.T, buf *bytes.Buffer) []string {
+	t.Helper()
+	var levels []string
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry struct{ Level string }
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("bad log line %q: %v", line, err)
+		}
+		levels = append(levels, entry.Level)
 	}
-	if cond1.nextItem != cond2 {
-		t.Errorf("cond1.nextItem != cond2")
+	buf.Reset()
+	return levels
+}
+
+func TestTapRequestLogging(t *testing.T) {
+	buf := captureLog(t)
+	tap := newIngestTap(&recordingPublisher{}, 0)
+	defer tap.Stop()
+
+	tap.requestHandler(tapRequest("add", "out", "", ""))
+	if got := logLevels(t, buf); len(got) != 1 || got[0] != "info" {
+		t.Errorf("new condition logged %v, want one info line", got)
 	}
-	if cond2.prevItem != cond1 {
-		t.Errorf("cond2.prevItem != cond1")
+	for i := 0; i < 3; i++ {
+		tap.requestHandler(tapRequest("add", "out", "", ""))
+	}
+	if got := logLevels(t, buf); len(got) != 3 || got[0] != "debug" || got[2] != "debug" {
+		t.Errorf("refreshes logged %v, want debug lines only", got)
+	}
+	tap.requestHandler(tapRequest("remove", "out", "", ""))
+	if got := logLevels(t, buf); len(got) != 1 || got[0] != "info" {
+		t.Errorf("remove logged %v, want one info line", got)
+	}
+}
+
+func TestTapRejectsBadRequests(t *testing.T) {
+	captureLog(t)
+	tap := newIngestTap(&recordingPublisher{}, 0)
+	defer tap.Stop()
+	tap.requestHandler(tapRequest("add", "out", "", "not-hex"))
+	tap.requestHandler(tapRequest("add", "", "", ""))
+	if !tap.conds.Load().empty() {
+		t.Errorf("a bad icao or a missing subject must not add a condition (it would match every frame)")
+	}
+	tap.requestHandler(tapRequest("add", "out", "", "7c49f8"))
+	set := tap.conds.Load()
+	if len(set.anyTag) != 1 || set.anyTag[0].icao != 0x7C49F8 || !set.withIcao {
+		t.Errorf("icao condition not parsed: %+v", set)
+	}
+}
+
+// Run with -race: requests change the conditions while frames flow through Handle and the workers.
+func TestTapConcurrentRequestsAndFrames(t *testing.T) {
+	captureLog(t)
+	pub := &recordingPublisher{}
+	tap := newIngestTap(pub, 4)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(tag string) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, fe := beastEvent(t, tapBeast7C49F8, tag)
+				tap.Handle(&fe)
+			}
+		}([]string{"a", "b", "c", "d"}[i])
+	}
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				tap.requestHandler(tapRequest("add", "out", "a", ""))
+				tap.requestHandler(tapRequest("add", "out", "", ""))
+				tap.expire()
+				tap.requestHandler(tapRequest("remove", "out", "", ""))
+			}
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	tap.Stop()
+	if n := conditionCount(tap); n != 1 {
+		t.Errorf("conditions = %d, want the api-key one", n)
 	}
 }

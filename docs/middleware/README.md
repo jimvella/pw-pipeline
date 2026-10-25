@@ -294,54 +294,57 @@ Dynamically subscribe to frame streams for specific feeders or aircraft. Acts as
 - Debug specific aircraft behavior
 - Monitor specific feeder
 - Collect sample frames for analysis
-- Real-time integration with external tools
+- Real-time integration with external tools, including long-running consumers that keep a tap open
 
 ### Architecture
 
 ```
-NATS Request → requestHandler → Add/Remove condition
-                                      ↓
-FrameEvent → Handle → queue → processQueue → Match conditions
-                                                ↓
-                                            Send to NATS subject
+NATS Request → requestHandler → add / refresh / remove condition → new snapshot
+                                                                       ↓
+FrameEvent → Handle → match snapshot → copy frame → queue → processQueue → NATS publish
+                          ↓ (no match)
+                       return frame
 ```
 
 **Components**:
-1. **Condition list**: Linked list of tap filters
-2. **Frame queue**: Buffered channel for frames to check
-3. **8 worker goroutines**: Process queue in parallel
-4. **NATS subscription**: Receive add/remove requests
+1. **Condition snapshot**: Immutable set of tap filters behind an `atomic.Pointer`
+2. **Last-added map**: When each condition was last added, under a mutex (requests only)
+3. **Frame queue**: Buffered channel of frame copies (`tapItem` values), 100 entries
+4. **8 worker goroutines**: Publish queued frames
+5. **Expiry goroutine**: Drops conditions that are not refreshed
+6. **NATS subscription**: Receives add/remove requests
 
-**Why 8 workers**: Balance parallelism vs overhead
+**Lock-free frame path**: `Handle` and the workers only load the snapshot pointer. Requests build a new snapshot and swap it in when a condition is added, removed or expires; a refresh only updates the last-added time. An idle tap costs one atomic load and a length check per frame.
+
+**Why 8 workers**: Several workers keep a burst from filling the queue
 - 1 worker: Single-threaded bottleneck
 - 8 workers: Good CPU utilization on multi-core
-- 16+ workers: Diminishing returns, more contention
+- 16+ workers: Diminishing returns, more contention on the NATS connection
 
 ### Condition Matching
 
 **Condition structure**:
 ```go
 type condition struct {
-    nextItem *condition  // Linked list next
-    prevItem *condition  // Linked list prev
-    queue    string      // NATS subject to send matches
-    apiKey   string      // Filter by feeder (empty = any)
-    icao     uint32      // Filter by aircraft (0 = any)
+    subject string // NATS subject to send matches
+    apiKey  string // Filter by feeder tag (empty = any)
+    icao    uint32 // Filter by aircraft (0 = any)
 }
 ```
 
-**Linked list pattern**: Easy add/remove at runtime
-
-**Match logic**:
+**Snapshot structure**:
 ```go
-func (c *condition) match(fe *FrameEvent) bool {
-    // Both must match if specified
-    isMatchAPIKey := (c.apiKey == "" || source.Tag == c.apiKey)
-    isMatchIcao := (c.icao == 0 || frame.Icao() == c.icao)
-
-    return isMatchAPIKey && isMatchIcao
+type conditionSet struct {
+    anyTag   []condition            // conditions without an api-key filter
+    byTag    map[string][]condition // conditions with one, keyed by api-key
+    withIcao bool                   // some condition filters on icao
 }
 ```
+
+**Match logic** (in `Handle`, before anything is queued):
+- Check every condition in `anyTag`, then `byTag[frame's tag]`
+- A condition matches if its `icao` is 0 or equals the frame's ICAO
+- The frame's ICAO is only looked up when some condition filters on it
 
 **AND logic**: Both API key and ICAO must match
 
@@ -365,6 +368,8 @@ func (c *condition) match(fe *FrameEvent) bool {
 {apiKey: "", icao: 0}
 ```
 
+**Only matching frames are queued**: a tap on one feeder or one aircraft never pushes the rest of the instance's traffic through the queue, so its own frames are not crowded out.
+
 ### Adding a Tap
 
 **NATS request to**: `v1.pw-ingest.tap`
@@ -377,13 +382,19 @@ icao: 7C1234
 subject: my-debug-stream
 ```
 
-**Response**: `Ack`
+**Response**: `Ack` from every pipeline instance
 
 **What happens**:
-1. Parse ICAO from hex string (0x7C1234)
-2. Create condition
-3. Append to linked list
+1. Parse ICAO from hex string (`7C1234`)
+2. If the same condition (subject, api-key, icao) already exists, refresh it and stop
+3. Otherwise add it and swap in a new snapshot
 4. Frames matching condition sent to `my-debug-stream`
+
+**Repeating `add` is safe**: it refreshes the existing condition, it never adds a second copy.
+
+**Rejected requests** (response `Error: ...`, nothing added):
+- `icao` that is not a hex number of up to 6 digits
+- No `subject`
 
 **Subject naming**: Choose unique subject per tap
 ```
@@ -391,6 +402,16 @@ debug.aircraft.7C1234
 monitor.feeder-123
 analysis.all-frames
 ```
+
+### Keeping a Tap Open: Expiry
+
+**A condition expires 5 minutes after its last `add`** (`TapConditionExpiry`), checked every 30 seconds.
+
+**To keep a tap open**: Repeat the same `add` request well within 5 minutes; once a minute is the convention. The `ingest_tap` command does this for you.
+
+**Why**: A client that crashes or loses its connection without sending `remove` would otherwise leave every pipeline instance publishing to a subject nobody reads, forever. With expiry nothing needs cleaning up after a crash.
+
+**Repeating also picks up new instances**: a pipeline instance started after the first request (a restart, a new container) has no conditions until the next `add` reaches it.
 
 ### Removing a Tap
 
@@ -405,84 +426,75 @@ subject: my-debug-stream
 ```
 
 **All three must match** to remove:
-- Same queue (subject)
+- Same subject
 - Same apiKey
 - Same icao
 
 **Why all three**: Precise removal, avoid accidentally removing wrong tap
 
-**Edge case**: If you have two taps with same filters but different subjects, only one is removed (the one matching all three fields)
+**Edge case**: If you have two taps with same filters but different subjects, only the one with the matching subject is removed
 
 ### Frame Format Preservation
 
 **Sends raw frame in original format**:
 ```go
-switch tFrame := fe.Frame().(type) {
+switch f := frame.(type) {
 case *beast.Frame:
-    headers["type"] = "beast"
-    msg = tFrame.Raw()
+    item.n = uint8(copy(item.raw[:], f.Raw())) // copied: the frame is pooled
+    item.typ = tapTypeBeast                    // "beast"
 case *mode_s.Frame:
-    headers["type"] = "avr"
-    msg = tFrame.Raw()
+    item.body = f.Raw()
+    item.typ = tapTypeAvr                      // "avr"
 case *sbs1.Frame:
-    headers["type"] = "sbs1"
-    msg = tFrame.Raw()
+    item.body = f.Raw()
+    item.typ = tapTypeSbs1                     // "sbs1"
 }
 ```
 
 **Why raw format**: Preserve all information
 - Beast: Includes timestamps, signal levels
-- AVR: Raw Mode S hex
+- AVR: Raw Mode S
 - SBS1: CSV format
 
 **Type header**: Consumer can decode appropriately
 
-**Tag header**: `headers["tag"] = fe.Source().Tag`
+**Tag header**: the frame source's `Tag`
 - Identifies which feeder sent frame
 - Useful when tap matches multiple feeders
+
+**Beast frames are copied in `Handle`**: Beast frames come from a `sync.Pool`, and the tracker releases them (zeroing their bytes) as soon as the middleware chain returns. `Handle` therefore copies the frame (at most 23 bytes) into the queue item; the queue holds values, so this costs no heap allocation. AVR and SBS frames are not pooled and are passed as is.
 
 ### Performance Considerations
 
 **Queue buffer: 100 frames**:
 ```go
-queue: make(chan *tracker.FrameEvent, 100)
+queue: make(chan tapItem, tapQueueLen) // 100
 ```
 
 **Why 100**:
 - Smaller than accounting queue (less critical)
 - Handle brief bursts
-- Not intended for sustained high-rate tapping
 
-**Overflow behavior**: Handle() blocks
-- Indicates tap consumers can't keep up
-- Backpressure to entire pipeline
-- Consider removing slow taps
+**Overflow behavior**: The frame is dropped from the tap
+- `Handle()` never blocks; the pipeline is unaffected
+- Frames dropped this way are not counted
+- If a tap misses frames, narrow its filters
 
-**Worker pool sizing**:
-```go
-for i := 0; i < 8; i++ {
-    tap.queueWg.Add(1)
-    go tap.processQueue()
-}
-```
+**Per-frame publish cost**: Each worker builds one `nats.Msg` with its `type` and `tag` headers and reuses it for every frame (`nats_io.Server.PublishMsg`).
 
-**Why 8**: CPU-bound work (condition matching)
-- Modern CPUs have 4-16 cores
-- 8 workers utilize multi-core well
-- More than CPU count OK (workers often wait on I/O)
+**Publish errors** (for example while NATS reconnects) are logged at most once every 10 seconds, not once per frame.
 
-**Scalability**: Linear with condition count
-- 1 condition: Fast (single check)
-- 10 conditions: Still fast (~10 checks)
-- 100 conditions: May slow down
-- 1000 conditions: Consider redesign (use map/set)
+**Scalability with condition count**:
+- Conditions with an api-key: one map lookup per frame, however many there are
+- Conditions without one: checked in turn; keep them few
+- Idle tap (no conditions): one atomic load per frame
 
 ### NATS Subscription
 
 **Unique queue name per instance**:
 ```go
 tap.natsQueue = "pw-ingest-tap-" + randstr.RandString(20)
-tap.sub, err = tap.natsServer.SubscribeReply(
+tap.sub, err = natsServer.SubscribeReply(
     NatsAPIv1PwIngestTap,
     tap.natsQueue,
     tap.requestHandler,
@@ -492,7 +504,7 @@ tap.sub, err = tap.natsServer.SubscribeReply(
 **Why random queue**: Multiple pipeline instances
 - Each instance has own subscription
 - Requests go to all instances (fanout)
-- All instances add the tap condition
+- All instances add the tap condition, and each replies `Ack`
 
 **Alternative**: Shared queue (only one instance handles request)
 - More efficient (fewer duplicate taps)
@@ -516,7 +528,7 @@ nats req v1.pw-ingest.tap "" \
   --header "subject:debug.7C1234"
 ```
 
-**Result**: All frames from 0x7C1234 forwarded to `debug.7C1234`
+**Result**: All frames from 0x7C1234 forwarded to `debug.7C1234` for 5 minutes; repeat the request to keep it open longer
 
 **Analysis**:
 ```bash
@@ -565,7 +577,7 @@ nats req v1.pw-ingest.tap "" \
 # Save first 1000 frames
 nats sub samples.all | head -n 1000 > samples.avr
 
-# Remove tap
+# Remove tap (or let it expire after 5 minutes)
 nats req v1.pw-ingest.tap "" \
   --header "action:remove" \
   --header "subject:samples.all"
@@ -586,12 +598,12 @@ Maintainers: If you add DF/TC filtering to IngestTap, document here
 **No authentication on tap requests**:
 - Anyone with NATS access can add taps
 - Taps can see all frames (privacy concern)
-- Malicious taps can DoS pipeline (backpressure)
+- A firehose tap adds one NATS message per frame to the bus
 
 **Mitigations**:
 1. **NATS security**: Restrict who can publish to `v1.pw-ingest.tap`
 2. **Network isolation**: NATS only on private network
-3. **Monitoring**: Log tap add/remove events
+3. **Monitoring**: Tap add, remove and expiry events are logged at Info
 
 **Production recommendation**: Add authentication
 ```go
@@ -611,24 +623,14 @@ Maintainers: If you add authentication to IngestTap, document here:
 
 ### Memory Management
 
-**Linked list size**: Unbounded
-- Each condition: ~48 bytes (3 pointers, string, uint32)
-- 100 taps: ~5 KB
-- 1000 taps: ~50 KB
-- 10,000 taps: ~500 KB
+**Condition count**: Bounded by what clients keep refreshing
+- Each condition: a few tens of bytes plus its strings
+- A condition not refreshed for 5 minutes is removed automatically
 
-**No automatic cleanup**: Taps persist until explicitly removed
-
-**Memory leak risk**: If clients add taps but don't remove
-- Consider TTL (time-to-live) for taps
-- Automatically remove taps after N minutes inactive
-
-<!--
-Maintainers: If you add TTL for taps, document here:
-- TTL duration
-- How to refresh TTL
-- Cleanup mechanism
--->
+**TTL**:
+- Duration: `TapConditionExpiry`, 5 minutes after the last `add`
+- Refresh: send the same `add` again (same subject, api-key and icao)
+- Cleanup: a goroutine checks every 30 seconds and logs each expiry at Info
 
 ## Middleware Comparison
 
@@ -678,23 +680,30 @@ Maintainers: If you add TTL for taps, document here:
 1. **Tap actually added**:
    ```
    # Should see log line
-   grep "Network Tap Request" pipeline.log | grep "action=add"
+   grep "Network Tap Request: condition added" pipeline.log
    ```
+   A refused request logs `Network Tap Request rejected` and replies `Error: ...`.
 
-2. **Matching frames exist**:
+2. **Tap still alive**: Conditions expire 5 minutes after the last `add`
+   ```
+   grep "Network Tap condition expired" pipeline.log
+   ```
+   Repeat the `add` at least every few minutes (the `ingest_tap` command does this every minute).
+
+3. **Matching frames exist**:
    ```
    # Check if aircraft is being tracked
    # Check if feeder is sending frames
    ```
 
-3. **ICAO format correct**:
+4. **ICAO format correct** (a bad ICAO is refused, not ignored):
    ```go
    // Correct: "7C1234" (hex string)
    // Wrong:   "0x7C1234" (will fail to parse)
    // Wrong:   "8110132" (decimal, not hex)
    ```
 
-4. **Subject reachable**:
+5. **Subject reachable**:
    ```bash
    # Test publishing directly
    nats pub your-subject "test"
@@ -704,41 +713,17 @@ Maintainers: If you add TTL for taps, document here:
 
 **Symptom**: Frame processing slows when many taps active
 
-**Cause**: Linear condition checking
-```go
-for c := tap.head; c != nil; c = c.nextItem {
-    if c.match(frame) {
-        tap.send(c.queue, frame)
-    }
-}
-```
-
-**Scale**: O(n) per frame where n = tap count
-- 10 taps: Negligible
-- 100 taps: Noticeable (~1% CPU)
-- 1000 taps: Significant (10%+ CPU)
+**Cause**: Each tapped frame is copied and published once per matching condition. Matching itself is cheap: conditions with an api-key are found by map lookup, so only conditions without one are checked in turn.
 
 **Solutions**:
 
-1. **Remove unused taps**:
+1. **Remove unused taps**, or let them expire:
    ```bash
    # Remove each tap when done
    nats req v1.pw-ingest.tap "" --header "action:remove" ...
    ```
 
-2. **Optimize condition matching** (code change):
-   ```go
-   // Use map for O(1) lookup instead of O(n) linear search
-   tapsByICAO map[uint32][]*condition
-   tapsByAPIKey map[string][]*condition
-   ```
-
-<!--
-Maintainers: If you optimize tap matching, document here:
-- Data structure used
-- Performance improvement
-- Trade-offs
--->
+2. **Prefer api-key filters** over many ICAO-only or match-all conditions.
 
 ## Production Lessons
 
