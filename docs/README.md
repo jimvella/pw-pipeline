@@ -117,6 +117,11 @@ Production services and utilities:
   - Aircraft enrichment (registration, type, operator)
   - Feeder statistics and management
 
+- **[pw_archiver](pw_archiver/README.md)** - Keeps the raw frames the network accepts
+  - Consumes the opt-in raw archive batches from `runway` / `pw_ingest`
+  - One zstd object per UTC minute, grouped by tile, de-duplicated
+  - Writes to S3 / Cloudflare R2; one archiver per network
+
 ### Utilities
 
 - **[recorder](recorder/README.md)** - Records ADS-B streams to disk files
