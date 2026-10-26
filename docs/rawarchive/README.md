@@ -33,7 +33,7 @@ frame bytes plus six per record.
 |---|---|
 | `instance` | Name of the publishing process: hostname plus a random suffix chosen at start, so a restart shows as a new instance. Settable with `--raw-archive-instance` |
 | `start` | Interval start, Unix milliseconds UTC, always on an interval boundary |
-| `dropped` | Frames this instance dropped from its queue since its previous message (the batcher never blocks the live path) |
+| `dropped` | Frames this instance lost since its previous message: dropped from its queue (the batcher never blocks the live path), or carried by a batch that failed to publish |
 | `v` | Format version, `1` |
 
 **Body**: records back to back, no body header.
@@ -151,5 +151,6 @@ want to check them.
 ## See Also
 
 - [middleware](../middleware/README.md): the Raw Archive middleware and its flags
+- [pw_archiver](../pw_archiver/README.md): the consumer, and the partition objects it writes
 - [tile_grid](../tile_grid/README.md): tile numbering
 - [nats_io](../nats_io/README.md): `PublishMsg`

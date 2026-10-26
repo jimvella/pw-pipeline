@@ -53,6 +53,7 @@ type (
 		stop      chan struct{}
 		done      chan struct{}
 		stopOnce  sync.Once
+		stopped   atomic.Bool
 		dropped   atomic.Uint64 // since the last message
 		processed atomic.Uint64 // items the batcher has taken from the queue; tests wait on it
 		lastError atomic.Int64  // unix nanos of the last publish error logged
@@ -182,6 +183,10 @@ func (r *RawArchive) Handle(fe *tracker.FrameEvent) tracker.Frame {
 		return nil
 	}
 	frame := fe.Frame()
+	if r.stopped.Load() {
+		// Nothing drains the queue after Stop; the frame goes on to the tracker only.
+		return frame
+	}
 	item, ok := r.newItem(frame, fe.Source())
 	if !ok {
 		return frame
@@ -237,10 +242,14 @@ func (item *rawItem) data() []byte {
 	return item.body
 }
 
-// Stop publishes what is queued and buffered, then returns. The tracker calls it once
-// decoding has finished, so Handle is no longer called.
+// Stop publishes what is queued and buffered, then returns. The tracker stops its
+// middleware while the producers are still winding down, so Handle may be called
+// again afterwards; those frames are not archived.
 func (r *RawArchive) Stop() {
-	r.stopOnce.Do(func() { close(r.stop) })
+	r.stopOnce.Do(func() {
+		r.stopped.Store(true)
+		close(r.stop)
+	})
 	<-r.done
 }
 
@@ -294,21 +303,30 @@ func (r *RawArchive) run() {
 			add(item)
 			r.processed.Add(1)
 		case <-timer.C:
-			r.publish(enc, start)
-			start = rawarchive.IntervalStart(r.now(), r.interval)
+			// Frames already queued were stamped before the boundary: file them in the
+			// interval that is closing rather than at offset 0 of the next one.
+			r.drain(add)
+			if !r.now().Before(start.Add(r.interval)) {
+				r.publish(enc, start)
+				start = rawarchive.IntervalStart(r.now(), r.interval)
+			}
 			timer.Reset(r.untilEnd(start))
 		case <-r.stop:
-			for {
-				select {
-				case item := <-r.queue:
-					add(item)
-					r.processed.Add(1)
-					continue
-				default:
-				}
-				break
-			}
+			r.drain(add)
 			r.publish(enc, start)
+			return
+		}
+	}
+}
+
+// drain passes everything in the queue to add without waiting for more.
+func (r *RawArchive) drain(add func(rawItem)) {
+	for {
+		select {
+		case item := <-r.queue:
+			add(item)
+			r.processed.Add(1)
+		default:
 			return
 		}
 	}
@@ -323,18 +341,24 @@ func (r *RawArchive) untilEnd(start time.Time) time.Duration {
 }
 
 // publish sends the buffer as one message and empties it. An empty buffer is sent too:
-// it is the heartbeat.
+// it is the heartbeat. A batch that fails to publish is lost; its records, and the
+// drop count it carried, are reported as dropped in the next message that gets through.
 func (r *RawArchive) publish(enc *rawarchive.Encoder, start time.Time) {
 	msg := nats.NewMsg(r.subject)
+	dropped := r.dropped.Swap(0)
 	rawarchive.SetHeader(msg, rawarchive.Header{
 		Instance: r.instance,
 		Start:    start,
-		Dropped:  r.dropped.Swap(0),
+		Dropped:  dropped,
 	})
 	msg.Data = enc.Bytes()
 	records := enc.Records()
 	// nats.go encodes the message before PublishMsg returns, so the buffer can be reused.
 	if err := r.pub.PublishMsg(msg); err != nil {
+		r.dropped.Add(dropped + uint64(records))
+		if nil != r.droppedCounter && records > 0 {
+			r.droppedCounter.Add(float64(records))
+		}
 		now := time.Now().UnixNano()
 		last := r.lastError.Load()
 		if now-last >= int64(rawArchiveErrorLogEvery) && r.lastError.CompareAndSwap(last, now) {

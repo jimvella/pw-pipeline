@@ -38,9 +38,18 @@ func newBatchRecorder() *batchRecorder {
 	return &batchRecorder{arrived: make(chan struct{}, 1000)}
 }
 
+func (b *batchRecorder) setErr(err error) {
+	b.mu.Lock()
+	b.err = err
+	b.mu.Unlock()
+}
+
 func (b *batchRecorder) PublishMsg(m *nats.Msg) error {
-	if b.err != nil {
-		return b.err
+	b.mu.Lock()
+	err := b.err
+	b.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	hdr, err := rawarchive.ParseHeader(m.Header)
 	if err != nil {
@@ -378,7 +387,7 @@ func TestRawArchiveStopPublishesBuffered(t *testing.T) {
 
 func TestRawArchivePublishErrorsDoNotStall(t *testing.T) {
 	rec := newBatchRecorder()
-	rec.err = nats.ErrConnectionClosed
+	rec.setErr(nats.ErrConnectionClosed)
 	clock := &fakeClock{t: time.Date(2026, 10, 26, 3, 7, 1, 0, time.UTC)}
 	r := newTestArchive(t, rec, clock, WithRawArchiveMaxBytes(RawArchiveMinMaxBytes))
 	_, fe := rawBeastEvent(t, rawBeast7C49F8, &perthLat, &perthLon)
@@ -391,6 +400,52 @@ func TestRawArchivePublishErrorsDoNotStall(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop hung while publishes fail")
+	}
+}
+
+func TestRawArchiveFailedPublishReportedAsDropped(t *testing.T) {
+	rec := newBatchRecorder()
+	t0 := time.Date(2026, 10, 26, 3, 7, 1, 0, time.UTC)
+	clock := &fakeClock{t: t0}
+	r := newTestArchive(t, rec, clock)
+	_, fe := rawBeastEvent(t, rawBeast7C49F8, &perthLat, &perthLon)
+	for i := 0; i < 3; i++ {
+		r.Handle(&fe)
+	}
+	settle(t, r, 3)
+	// The first interval's batch fails to publish.
+	rec.setErr(nats.ErrConnectionClosed)
+	clock.set(t0.Add(61 * time.Second))
+	r.Handle(&fe) // closes the first interval, which fails, and opens the second
+	settle(t, r, 4)
+	rec.setErr(nil)
+	r.Stop()
+	batches := rec.all()
+	if len(batches) != 1 {
+		t.Fatalf("got %d batches, want 1 (the failed one is lost)", len(batches))
+	}
+	if len(batches[0].recs) != 1 || batches[0].hdr.Dropped != 3 {
+		t.Errorf("batch after a failed publish: %d records, dropped %d; want 1 and 3", len(batches[0].recs), batches[0].hdr.Dropped)
+	}
+}
+
+func TestRawArchiveIgnoresFramesAfterStop(t *testing.T) {
+	rec := newBatchRecorder()
+	clock := &fakeClock{t: time.Date(2026, 10, 26, 3, 7, 1, 0, time.UTC)}
+	r := newTestArchive(t, rec, clock)
+	_, fe := rawBeastEvent(t, rawBeast7C49F8, &perthLat, &perthLon)
+	r.Handle(&fe)
+	r.Stop()
+	for i := 0; i < 10; i++ {
+		if got := r.Handle(&fe); got == nil {
+			t.Fatal("Handle returned nil after Stop")
+		}
+	}
+	if n := len(r.queue); n != 0 {
+		t.Errorf("%d frames queued after Stop", n)
+	}
+	if batches := rec.all(); len(batches) != 1 || len(batches[0].recs) != 1 {
+		t.Fatalf("got %+v", batches)
 	}
 }
 
