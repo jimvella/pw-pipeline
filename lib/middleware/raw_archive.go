@@ -62,6 +62,7 @@ type (
 		recordsCounter   prometheus.Counter
 	}
 
+	// RawArchiveOption configures a RawArchive at construction.
 	RawArchiveOption func(*RawArchive)
 
 	rawPublisher interface {
