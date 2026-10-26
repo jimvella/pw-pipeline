@@ -649,7 +649,7 @@ network-wide consumer.
 - **Size flush**: a body over `--raw-archive-max-bytes` (default 512 KiB)
   is published early with the same `start`, keeping under the NATS payload
   limit.
-- **Never blocks**: `Handle` copies the frame into a 10,000-entry queue and
+- **Never blocks**: `Handle` copies the frame into a 1,000-entry queue and
   returns. A full queue drops the frame from the archive only, counts it
   (`pw_raw_archive_dropped_frames_total`) and reports it in the next
   message's `dropped` header.

@@ -28,7 +28,7 @@ const (
 	// RawArchiveMinMaxBytes is the smallest size cap accepted.
 	RawArchiveMinMaxBytes = 1024
 
-	rawArchiveQueueLen      = 10000
+	rawArchiveQueueLen      = 1000 // handoff only; the batcher drains it continuously
 	rawArchiveErrorLogEvery = 10 * time.Second
 	rawArchiveBeastMaxLen   = 23 // esc, type, 6 byte timestamp, signal, 14 byte Mode S
 )
