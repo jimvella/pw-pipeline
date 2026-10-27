@@ -23,6 +23,8 @@ type (
 		FlightStatus time.Time
 		Special      time.Time
 		Squawk       time.Time
+		Nav          time.Time
+		EHS          time.Time
 	}
 
 	// PlaneLocation is our exported data format. it encodes to JSON
@@ -70,6 +72,24 @@ type (
 
 		AircraftWidth  *float32 `json:",omitempty"`
 		AircraftLength *float32 `json:",omitempty"`
+
+		// Navigation state from TC29 target state and status, or Comm-B
+		// BDS 4,0: what the flight control system is set to. Omitted for
+		// aircraft that do not report it, and dropped 60 s after the last
+		// report.
+		NavAltitudeMCP *int     `json:",omitempty"` // feet, MCP/FCU selected altitude (the "alt bug")
+		NavAltitudeFMS *int     `json:",omitempty"` // feet, FMS selected altitude
+		NavQNH         *float64 `json:",omitempty"` // hPa, barometric pressure setting
+		NavHeading     *float64 `json:",omitempty"` // degrees, selected heading
+		NavModes       []string `json:",omitempty"` // autopilot, vnav, lnav, althold, approach, tcas
+
+		// Enhanced surveillance from Comm-B BDS 5,0 and 6,0, same lifetime
+		// as the nav fields.
+		IAS        *int     `json:",omitempty"` // knots, indicated airspeed
+		TAS        *int     `json:",omitempty"` // knots, true airspeed
+		Mach       *float64 `json:",omitempty"`
+		Roll       *float64 `json:",omitempty"` // degrees, right wing down positive
+		MagHeading *float64 `json:",omitempty"` // degrees, magnetic heading
 
 		// Enrichment Plane data
 		IcaoCode        *string `json:",omitempty"`
@@ -289,6 +309,23 @@ func MergePlaneLocations(prev, next PlaneLocation) (PlaneLocation, error) {
 		merged.Updates.Special = next.Updates.Special
 	}
 
+	if next.HasNav() && next.Updates.Nav.After(prev.Updates.Nav) {
+		merged.NavAltitudeMCP = next.NavAltitudeMCP
+		merged.NavAltitudeFMS = next.NavAltitudeFMS
+		merged.NavQNH = next.NavQNH
+		merged.NavHeading = next.NavHeading
+		merged.NavModes = next.NavModes
+		merged.Updates.Nav = next.Updates.Nav
+	}
+	if next.HasEHS() && next.Updates.EHS.After(prev.Updates.EHS) {
+		merged.IAS = next.IAS
+		merged.TAS = next.TAS
+		merged.Mach = next.Mach
+		merged.Roll = next.Roll
+		merged.MagHeading = next.MagHeading
+		merged.Updates.EHS = next.Updates.EHS
+	}
+
 	if next.TileLocation != "" {
 		merged.TileLocation = next.TileLocation
 	}
@@ -414,6 +451,23 @@ func IsLocationPossible(prev, next PlaneLocation) bool {
 			Msg("Rejected Position")
 	}
 	return false
+}
+
+// HasNav is true when any navigation field is present
+func (pl *PlaneLocation) HasNav() bool {
+	if nil == pl {
+		return false
+	}
+	return pl.NavAltitudeMCP != nil || pl.NavAltitudeFMS != nil || pl.NavQNH != nil ||
+		pl.NavHeading != nil || len(pl.NavModes) > 0
+}
+
+// HasEHS is true when any enhanced surveillance field is present
+func (pl *PlaneLocation) HasEHS() bool {
+	if nil == pl {
+		return false
+	}
+	return pl.IAS != nil || pl.TAS != nil || pl.Mach != nil || pl.Roll != nil || pl.MagHeading != nil
 }
 
 func (pl *PlaneLocation) CallSignStr() string {

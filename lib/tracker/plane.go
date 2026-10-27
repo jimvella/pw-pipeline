@@ -83,6 +83,8 @@ type (
 		recentFrames    lossyFrameList
 		locationHistory []*PlaneLocation
 		cprLocation     CprLocation
+		nav             navTracking
+		ehs             ehsTracking
 		msgCount        uint64
 		rwLock          sync.RWMutex
 		squawk          uint32

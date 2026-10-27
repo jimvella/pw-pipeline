@@ -399,7 +399,7 @@ func (p *Plane) HandleModeSFrame(frame *mode_s.Frame, source *FrameSource) {
 			}
 		case mode_s.DF17FrameTargetStateStatus:
 			{
-				debugMessage("\033[2m Ignoring: DF%d %s\033[0m", frame.DownLinkType(), messageType)
+				hasChanged = p.handleTargetState(frame.Raw(), frame.TimeStamp()) || hasChanged
 			}
 		case mode_s.DF17FrameAircraftOperational:
 			{
@@ -421,8 +421,8 @@ func (p *Plane) HandleModeSFrame(frame *mode_s.Frame, source *FrameSource) {
 		case mode_s.BdsElsAircraftIdent: // 2.0
 			hasChanged = p.setFlightNumber(frame.FlightNumber()) || hasChanged
 		default:
-			// let's see if we can decode more BDS info
-			// TODO: Decode Other BDS frames
+			// EHS registers (BDS 4,0 / 5,0 / 6,0) via go-adsb, see commb.go
+			hasChanged = p.handleCommB(frame.Raw(), frame.TimeStamp()) || hasChanged
 		}
 	}
 
