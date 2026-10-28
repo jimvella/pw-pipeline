@@ -3,8 +3,10 @@ package mode_s
 import (
 	"errors"
 	"fmt"
-	"github.com/rs/zerolog/log"
+	"math"
 	"strings"
+
+	"github.com/rs/zerolog/log"
 )
 
 const (
@@ -81,7 +83,21 @@ func (f *Frame) decodeCommB() error {
 		}
 	}
 
+	if errors.Is(err, ErrUnknownCommBMessage) {
+		var alt *int32
+		if f.downLinkFormat == 20 && f.validAltitude && f.unit == modesUnitFeet {
+			a := f.altitude
+			alt = &a
+		}
+		f.commB = decodeEhs(f.message[4:11], alt)
+		if f.commB != nil && len(f.commB.Candidates) == 1 {
+			f.setBds(f.commB.Candidates[0])
+		}
+	}
+
 	switch f.BdsMessageType() {
+	case BdsEhsSelVertIntent: // 4.0, sole candidate
+		f.targetState = f.commB.B40.targetState()
 	case BdsElsDataLinkCap: // 1.0
 		// decode capability
 	case BdsElsGicbCap: // 1.7
@@ -107,6 +123,21 @@ func (f *Frame) decodeCommB() error {
 	return nil
 }
 
+// setBds sets the register from a code in "4.0" form.
+func (f *Frame) setBds(code string) {
+	f.bdsMajor, f.bdsMinor = code[0]-'0', code[2]-'0'
+}
+
+func (b *Bds40) targetState() *TargetState {
+	return &TargetState{
+		Source:              TargetStateFromCommB,
+		SelectedAltitudeMcp: b.SelectedAltitudeMcp,
+		SelectedAltitudeFms: b.SelectedAltitudeFms,
+		BaroSetting:         b.BaroSetting,
+		NavModes:            b.NavModes,
+	}
+}
+
 // inferCommBMessageType uses some fancy guesswork to determine the type of response we have.
 // pass in the Comm-B message bytes (MB Field)
 // decoding based on this https://mode-s.org/decode/content/mode-s/9-inference.html
@@ -128,7 +159,7 @@ func inferCommBMessageType(mb []byte) (byte, byte, error) {
 	// BDS 1,7 - Common usage GICB capability report
 	// bit 7 == 1, bits 29-56 zeros
 	// Detection: BDS Code && Reserved Bits
-	if mb[0]&0x2 == 0x2 && ((0 == mb[3]&0xF) && (0 == mb[4]+mb[5]+mb[6])) {
+	if mb[0]&0x2 == 0x2 && ((0 == mb[3]&0xF) && (0 == mb[4]|mb[5]|mb[6])) {
 		return 1, 7, nil
 	}
 
@@ -152,11 +183,427 @@ func inferCommBMessageType(mb []byte) (byte, byte, error) {
 		return 3, 0, nil
 	}
 
-	// Now onto EHS Detection
-	// TODO: implement EHS
+	// EHS registers are tested separately (decodeEhs): several can match.
 
 	// and lastly onto Meteorological Detection
 	// TODO: Implement MRAR and MHR
 
 	return 0, 0, ErrUnknownCommBMessage
+}
+
+// Comm-B Enhanced Surveillance (EHS) registers: BDS 4,0, 5,0 and 6,0.
+//
+// A Comm-B reply does not say which register it carries: the register number
+// is in the interrogation, which receivers do not hear. Each register is
+// tested in turn (status bits consistent with their values, reserved bits
+// zero, values in range), following https://mode-s.org/decode/content/mode-s/9-inference.html.
+// More than one register can pass. 5,0 and 6,0 are then told apart against
+// the aircraft's known speed and track (ResolveCommB); other ambiguous
+// replies are left undecided.
+//
+// Bit numbers below are within the 56-bit MB field (message bits 33-88).
+
+// Bds40 is the Selected Vertical Intention register.
+type Bds40 struct {
+	SelectedAltitudeMcp *int32   // ft
+	SelectedAltitudeFms *int32   // ft
+	BaroSetting         *float64 // hPa
+	NavModes            *NavModes
+	TargetAltSource     *byte // 0 unknown, 1 aircraft altitude, 2 MCP/FCU, 3 FMS
+}
+
+// Bds50 is the Track and Turn Report.
+type Bds50 struct {
+	Roll         *float64 // degrees, right wing down positive
+	TrueTrack    *float64 // degrees
+	GroundSpeed  *float64 // kt
+	TrackRate    *float64 // degrees per second
+	TrueAirspeed *float64 // kt
+}
+
+// Bds60 is the Heading and Speed Report.
+type Bds60 struct {
+	MagneticHeading      *float64 // degrees
+	IndicatedAirspeed    *float64 // kt
+	Mach                 *float64
+	BaroVerticalRate     *float64 // ft/min
+	InertialVerticalRate *float64 // ft/min
+}
+
+// CommB holds every EHS register a reply could be.
+type CommB struct {
+	Candidates []string // BDS codes in "4.0" form, in test order
+	B40        *Bds40
+	B50        *Bds50
+	B60        *Bds60
+}
+
+// CommB returns the EHS candidates for a DF20/21 reply, or nil when the reply
+// matched an ELS register (1,0, 1,7, 2,0, 3,0) or no register at all.
+func (f *Frame) CommB() *CommB {
+	if f == nil {
+		return nil
+	}
+	return f.commB
+}
+
+// decodeEhs tests the MB field against the EHS registers. altFt is the
+// altitude from a DF20 header, or nil, for the Mach/airspeed check.
+func decodeEhs(mb []byte, altFt *int32) *CommB {
+	if allZero(mb) {
+		return nil
+	}
+	c := &CommB{}
+	if b := decodeBds40(mb); b != nil {
+		c.B40 = b
+		c.Candidates = append(c.Candidates, BdsEhsSelVertIntent)
+	}
+	if b := decodeBds50(mb); b != nil {
+		c.B50 = b
+		c.Candidates = append(c.Candidates, BdsEhsTrackTurnReport)
+	}
+	if b := decodeBds60(mb, altFt); b != nil {
+		c.B60 = b
+		c.Candidates = append(c.Candidates, BdsEhsHeadingSpeed)
+	}
+	if len(c.Candidates) == 0 {
+		return nil
+	}
+	return c
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// field reads value bits first..last guarded by status bit `status`. It
+// returns ok=false when the status is clear but the value is not zero, which
+// rules the register out.
+func field(mb []byte, status, first, last int) (raw uint64, present, ok bool) {
+	raw = bitsAt(mb, first, last)
+	if bitsAt(mb, status, status) == 0 {
+		return 0, false, raw == 0
+	}
+	return raw, true, true
+}
+
+// signedField is field with a sign bit at first and magnitude first+1..last.
+func signedField(mb []byte, status, first, last int) (v int64, present, ok bool) {
+	if bitsAt(mb, status, status) == 0 {
+		return 0, false, bitsAt(mb, first, last) == 0
+	}
+	return signedBitsAt(mb, first, last), true, true
+}
+
+func f64(v float64) *float64 { return &v }
+
+func decodeBds40(mb []byte) *Bds40 {
+	// Reserved bits 40-47 and 52-53 must be zero.
+	if bitsAt(mb, 40, 47) != 0 || bitsAt(mb, 52, 53) != 0 {
+		return nil
+	}
+	b := &Bds40{}
+	mcp, hasMcp, ok1 := field(mb, 1, 2, 13)
+	fms, hasFms, ok2 := field(mb, 14, 15, 26)
+	baro, hasBaro, ok3 := field(mb, 27, 28, 39)
+	modes, hasModes, ok4 := field(mb, 48, 49, 51)
+	src, hasSrc, ok5 := field(mb, 54, 55, 56)
+	if !(ok1 && ok2 && ok3 && ok4 && ok5) {
+		return nil
+	}
+	if !(hasMcp || hasFms || hasBaro || hasModes || hasSrc) {
+		return nil
+	}
+	if hasMcp {
+		a := int32(mcp) * 16
+		if a > 50000 {
+			return nil
+		}
+		b.SelectedAltitudeMcp = &a
+	}
+	if hasFms {
+		a := int32(fms) * 16
+		if a > 50000 {
+			return nil
+		}
+		b.SelectedAltitudeFms = &a
+	}
+	if hasBaro {
+		b.BaroSetting = f64(800 + float64(baro)*0.1)
+	}
+	if hasModes {
+		var m NavModes
+		if modes&0b100 != 0 {
+			m |= NavModeVNAV
+		}
+		if modes&0b010 != 0 {
+			m |= NavModeAltHold
+		}
+		if modes&0b001 != 0 {
+			m |= NavModeApproach
+		}
+		b.NavModes = &m
+	}
+	if hasSrc {
+		s := byte(src)
+		b.TargetAltSource = &s
+	}
+	return b
+}
+
+func decodeBds50(mb []byte) *Bds50 {
+	b := &Bds50{}
+	roll, hasRoll, ok1 := signedField(mb, 1, 2, 11)
+	trk, hasTrk, ok2 := signedField(mb, 12, 13, 23)
+	gs, hasGs, ok3 := field(mb, 24, 25, 34)
+	rate, hasRate, ok4 := signedField(mb, 35, 36, 45)
+	tas, hasTas, ok5 := field(mb, 46, 47, 56)
+	if !(ok1 && ok2 && ok3 && ok4 && ok5) {
+		return nil
+	}
+	if hasRoll {
+		r := float64(roll) * 45 / 256
+		// Beyond 35 degrees is almost always another register read as 5,0.
+		if math.Abs(r) > 35 {
+			return nil
+		}
+		b.Roll = &r
+	}
+	if hasTrk {
+		t := float64(trk) * 90 / 512
+		if t < 0 {
+			t += 360
+		}
+		b.TrueTrack = &t
+	}
+	if hasGs {
+		g := float64(gs) * 2
+		if g > 600 {
+			return nil
+		}
+		b.GroundSpeed = &g
+	}
+	if hasRate {
+		b.TrackRate = f64(float64(rate) * 8 / 256)
+	}
+	if hasTas {
+		t := float64(tas) * 2
+		if t > 600 {
+			return nil
+		}
+		b.TrueAirspeed = &t
+	}
+	if b.GroundSpeed != nil && b.TrueAirspeed != nil && math.Abs(*b.GroundSpeed-*b.TrueAirspeed) > 200 {
+		return nil
+	}
+	if b.Roll == nil && b.TrueTrack == nil && b.GroundSpeed == nil && b.TrackRate == nil && b.TrueAirspeed == nil {
+		return nil
+	}
+	return b
+}
+
+func decodeBds60(mb []byte, altFt *int32) *Bds60 {
+	b := &Bds60{}
+	hdg, hasHdg, ok1 := signedField(mb, 1, 2, 12)
+	ias, hasIas, ok2 := field(mb, 13, 14, 23)
+	mach, hasMach, ok3 := field(mb, 24, 25, 34)
+	vrb, hasVrb, ok4 := signedField(mb, 35, 36, 45)
+	vri, hasVri, ok5 := signedField(mb, 46, 47, 56)
+	if !(ok1 && ok2 && ok3 && ok4 && ok5) {
+		return nil
+	}
+	if hasHdg {
+		h := float64(hdg) * 90 / 512
+		if h < 0 {
+			h += 360
+		}
+		b.MagneticHeading = &h
+	}
+	if hasIas {
+		v := float64(ias)
+		if v > 500 {
+			return nil
+		}
+		b.IndicatedAirspeed = &v
+	}
+	if hasMach {
+		m := float64(mach) * 2.048 / 512
+		if m > 1 {
+			return nil
+		}
+		b.Mach = &m
+	}
+	if hasVrb {
+		v := float64(vrb) * 32
+		if math.Abs(v) > 6000 {
+			return nil
+		}
+		b.BaroVerticalRate = &v
+	}
+	if hasVri {
+		v := float64(vri) * 32
+		if math.Abs(v) > 6000 {
+			return nil
+		}
+		b.InertialVerticalRate = &v
+	}
+	// IAS and Mach must agree at the reported altitude.
+	if b.IndicatedAirspeed != nil && b.Mach != nil && altFt != nil {
+		if math.Abs(*b.IndicatedAirspeed-machToCas(*b.Mach, float64(*altFt))) > 20 {
+			return nil
+		}
+	}
+	if b.MagneticHeading == nil && b.IndicatedAirspeed == nil && b.Mach == nil &&
+		b.BaroVerticalRate == nil && b.InertialVerticalRate == nil {
+		return nil
+	}
+	return b
+}
+
+// KnownState is what the tracker already knows about the aircraft, used to
+// choose between ambiguous Comm-B candidates.
+type KnownState struct {
+	GroundSpeed float64 // kt
+	Track       float64 // degrees
+	HasVelocity bool
+	AltitudeFt  float64
+	HasAltitude bool
+}
+
+// ResolveCommB settles a DF20/21 reply that could be either BDS 5,0 or 6,0
+// using what the caller knows about the aircraft, and reports whether the
+// frame now has a register. The decoder is stateless: it does not know the
+// aircraft's ground speed and track, which is the one thing that tells the
+// two registers apart. The tracker, which does, calls this before reading
+// BdsMessageType. A frame already settled (an ELS register, or a sole EHS
+// candidate) is unchanged.
+func (f *Frame) ResolveCommB(k KnownState) bool {
+	if f == nil || f.commB == nil {
+		return false
+	}
+	if f.bdsMajor != 0 {
+		return true
+	}
+	code := ResolveCommB(f.commB, k)
+	if code == "" {
+		return false
+	}
+	f.setBds(code)
+	return true
+}
+
+// ResolveCommB picks one register for an ambiguous reply, or "" when it
+// cannot. A single candidate is returned as is. 5,0 against 6,0 is decided by
+// which one's speed and direction is closer to the known ground speed and
+// track: 5,0 reports ground speed and track, 6,0 airspeed and heading, which
+// differ only by the wind.
+func ResolveCommB(c *CommB, k KnownState) string {
+	if c == nil || len(c.Candidates) == 0 {
+		return ""
+	}
+	if len(c.Candidates) == 1 {
+		return c.Candidates[0]
+	}
+	if c.B50 == nil || c.B60 == nil || c.B40 != nil || !k.HasVelocity {
+		return ""
+	}
+	d50, ok50 := vectorDistance(spd50(c.B50), c.B50.TrueTrack, k)
+	d60, ok60 := vectorDistance(spd60(c.B60, k), c.B60.MagneticHeading, k)
+	switch {
+	case ok50 && ok60:
+		if d50 < d60 {
+			return BdsEhsTrackTurnReport
+		}
+		return BdsEhsHeadingSpeed
+	case ok50:
+		return BdsEhsTrackTurnReport
+	case ok60:
+		return BdsEhsHeadingSpeed
+	}
+	return ""
+}
+
+func spd50(b *Bds50) *float64 {
+	if b.GroundSpeed != nil {
+		return b.GroundSpeed
+	}
+	return b.TrueAirspeed
+}
+
+func spd60(b *Bds60, k KnownState) *float64 {
+	switch {
+	case b.Mach != nil && k.HasAltitude:
+		return f64(*b.Mach * speedOfSound(k.AltitudeFt))
+	case b.IndicatedAirspeed != nil && k.HasAltitude:
+		return f64(casToTas(*b.IndicatedAirspeed, k.AltitudeFt))
+	}
+	return b.IndicatedAirspeed
+}
+
+func vectorDistance(spd, dir *float64, k KnownState) (float64, bool) {
+	if spd == nil || dir == nil {
+		return 0, false
+	}
+	r := func(d float64) float64 { return d * math.Pi / 180 }
+	dx := *spd*math.Sin(r(*dir)) - k.GroundSpeed*math.Sin(r(k.Track))
+	dy := *spd*math.Cos(r(*dir)) - k.GroundSpeed*math.Cos(r(k.Track))
+	return math.Hypot(dx, dy), true
+}
+
+// --- ISA atmosphere, enough for airspeed conversions ---
+
+const (
+	isaP0     = 101325.0  // Pa
+	isaRho0   = 1.225     // kg/m3
+	isaT0     = 288.15    // K
+	isaR      = 287.05287 // J/(kg K)
+	isaGamma  = 1.4
+	isaLapse  = 0.0065 // K/m
+	isaTropo  = 11000.0
+	isaG0     = 9.80665
+	ftToM     = 0.3048
+	msToKt    = 1 / 0.514444
+	isaTTropo = 216.65
+)
+
+func isaTempPress(altFt float64) (t, p float64) {
+	h := altFt * ftToM
+	if h < isaTropo {
+		t = isaT0 - isaLapse*h
+		p = isaP0 * math.Pow(t/isaT0, isaG0/(isaLapse*isaR))
+		return t, p
+	}
+	pTropo := isaP0 * math.Pow(isaTTropo/isaT0, isaG0/(isaLapse*isaR))
+	return isaTTropo, pTropo * math.Exp(-isaG0/(isaR*isaTTropo)*(h-isaTropo))
+}
+
+// speedOfSound returns the ISA speed of sound in knots.
+func speedOfSound(altFt float64) float64 {
+	t, _ := isaTempPress(altFt)
+	return math.Sqrt(isaGamma*isaR*t) * msToKt
+}
+
+// machToCas converts Mach at a pressure altitude to calibrated airspeed (kt).
+func machToCas(mach, altFt float64) float64 {
+	_, p := isaTempPress(altFt)
+	k := isaGamma / (isaGamma - 1)
+	qc := p * (math.Pow(1+(isaGamma-1)/2*mach*mach, k) - 1)
+	cas := math.Sqrt(2 * k * isaP0 / isaRho0 * (math.Pow(qc/isaP0+1, 1/k) - 1))
+	return cas * msToKt
+}
+
+// casToTas converts calibrated to true airspeed (kt) at a pressure altitude.
+func casToTas(casKt, altFt float64) float64 {
+	t, p := isaTempPress(altFt)
+	k := isaGamma / (isaGamma - 1)
+	cas := casKt / msToKt
+	qc := isaP0 * (math.Pow(1+cas*cas/(2*k*isaP0/isaRho0), k) - 1)
+	rho := p / (isaR * t)
+	tas := math.Sqrt(2 * k * p / rho * (math.Pow(qc/p+1, 1/k) - 1))
+	return tas * msToKt
 }

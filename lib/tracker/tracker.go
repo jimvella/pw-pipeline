@@ -399,7 +399,7 @@ func (p *Plane) HandleModeSFrame(frame *mode_s.Frame, source *FrameSource) {
 			}
 		case mode_s.DF17FrameTargetStateStatus:
 			{
-				hasChanged = p.handleTargetState(frame.Raw(), frame.TimeStamp()) || hasChanged
+				hasChanged = p.setTargetState(frame.TargetState(), frame.TimeStamp()) || hasChanged
 			}
 		case mode_s.DF17FrameAircraftOperational:
 			{
@@ -411,6 +411,9 @@ func (p *Plane) HandleModeSFrame(frame *mode_s.Frame, source *FrameSource) {
 		}
 
 	case 20, 21:
+		// A reply that could be BDS 5,0 or 6,0 is settled with what we know
+		// of the aircraft's velocity; the decoder alone cannot tell them apart.
+		frame.ResolveCommB(p.knownState(frame.TimeStamp()))
 		switch frame.BdsMessageType() {
 		case mode_s.BdsElsDataLinkCap: // 1.0
 			hasChanged = p.setSquawkIdentity(frame.SquawkIdentity(), frame.TimeStamp()) || hasChanged
@@ -420,9 +423,23 @@ func (p *Plane) HandleModeSFrame(frame *mode_s.Frame, source *FrameSource) {
 			}
 		case mode_s.BdsElsAircraftIdent: // 2.0
 			hasChanged = p.setFlightNumber(frame.FlightNumber()) || hasChanged
+		case mode_s.BdsEhsSelVertIntent: // 4.0
+			if c := frame.CommB(); c != nil {
+				hasChanged = p.setBds40(c.B40, frame.TimeStamp()) || hasChanged
+			}
+		case mode_s.BdsEhsTrackTurnReport: // 5.0
+			if c := frame.CommB(); c != nil {
+				hasChanged = p.setBds50(c.B50, frame.TimeStamp()) || hasChanged
+			}
+		case mode_s.BdsEhsHeadingSpeed: // 6.0
+			if c := frame.CommB(); c != nil {
+				hasChanged = p.setBds60(c.B60, frame.TimeStamp()) || hasChanged
+			}
 		default:
-			// EHS registers (BDS 4,0 / 5,0 / 6,0) via go-adsb, see commb.go
-			hasChanged = p.handleCommB(frame.Raw(), frame.TimeStamp()) || hasChanged
+			// let's see if we can decode more BDS info
+			// TODO: Decode Other BDS frames: 4,3 4,4 4,5 5,1 5,2 5,3 are not
+			// inferred yet (see TestCommBRegisters in mode_s), and 1,0 / 1,7
+			// are inferred but nothing is read from them.
 		}
 	}
 

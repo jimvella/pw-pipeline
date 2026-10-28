@@ -167,9 +167,8 @@ Roll       *float64 // -11.25 degrees, right wing down positive
 MagHeading *float64 // 337.68 degrees, magnetic heading
 ```
 
-**Where they come from**: the tracker decodes them with
-[go-adsb](https://github.com/shaneshort/go-adsb) from frames the built-in
-decoder does not cover (`lib/tracker/commb.go`):
+**Where they come from**: `lib/tracker/mode_s` decodes them
+(`decode-adsb.go`, `decode-bds.go`) from frames it previously ignored:
 
 | Fields | Source |
 |---|---|

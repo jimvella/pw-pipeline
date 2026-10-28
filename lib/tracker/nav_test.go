@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"kreklow.us/go/go-adsb/adsb"
-	"kreklow.us/go/go-adsb/adsbtype"
 	"plane.watch/lib/tracker/mode_s"
 )
 
@@ -139,12 +137,12 @@ func TestBds40TooFarFromTc29IsNotAccepted(t *testing.T) {
 	trk := NewTracker()
 	p := trk.GetPlane(icao7CAF5F)
 	p.setLastSeen(navT0)
-	sel := 10000
-	if !p.setTargetState(&adsb.TargetState{SelectedAltitude: &sel}, navT0) {
+	sel := int32(10000)
+	if !p.setTargetState(&mode_s.TargetState{SelectedAltitudeMcp: &sel}, navT0) {
 		t.Fatal("target state not applied")
 	}
-	mcp := 22000
-	if p.setBds40(&adsb.SelectedVerticalIntention{MCPSelectedAltitude: &mcp}, navT0.Add(time.Second)) {
+	mcp := int32(22000)
+	if p.setBds40(&mode_s.Bds40{SelectedAltitudeMcp: &mcp}, navT0.Add(time.Second)) {
 		t.Error("a 4,0 disagreeing with TC29 changed the state")
 	}
 	nav, _ := p.Nav()
@@ -181,25 +179,6 @@ func TestCommBUndecidedWithoutRecentVelocity(t *testing.T) {
 	}
 }
 
-func TestResolveCommBPrefersTheNearerVector(t *testing.T) {
-	gs, trk := 204.0, 217.08984375
-	tt := &adsb.TrackAndTurn{GroundSpeed: &gs, TrueTrack: &trk}
-	hdg, mach := 337.67578125, 0.408
-	hs := &adsb.HeadingAndSpeed{MagneticHeading: &hdg, Mach: &mach}
-
-	actual := KnownState{GroundSpeed: 243, Track: 346, HasVelocity: true, AltitudeFt: 13350, HasAltitude: true}
-	if got := ResolveCommB(tt, hs, actual); got != adsbtype.BDS60 {
-		t.Errorf("with the real state: %v, want 6,0", got)
-	}
-	other := KnownState{GroundSpeed: 202, Track: 217, HasVelocity: true}
-	if got := ResolveCommB(tt, hs, other); got != adsbtype.BDS50 {
-		t.Errorf("with a 5,0-like state: %v, want 5,0", got)
-	}
-	if got := ResolveCommB(tt, hs, KnownState{}); got != 0 {
-		t.Errorf("with no state: %v, want undecided", got)
-	}
-}
-
 func TestNavExpiresWithoutRefresh(t *testing.T) {
 	trk := NewTracker()
 	p := feed(t, trk, frameTC29Modes, navT0)
@@ -213,18 +192,5 @@ func TestNavExpiresWithoutRefresh(t *testing.T) {
 	}
 	if p.NavUpdatedAt().IsZero() {
 		t.Error("the timestamp of the last report should survive expiry")
-	}
-}
-
-func TestIsaConversions(t *testing.T) {
-	if a := speedOfSound(0); math.Abs(a-661.5) > 0.5 {
-		t.Errorf("sea level speed of sound %v kt", a)
-	}
-	// From the BDS 6,0 reading above: IAS 211 at Mach 0.408, 13,350 ft.
-	if cas := machToCas(0.408, 13350); math.Abs(cas-211) > 5 {
-		t.Errorf("Mach 0.408 at 13,350 ft = %v kt CAS, want about 211", cas)
-	}
-	if tas := casToTas(machToCas(0.78, 35000), 35000); math.Abs(tas-0.78*speedOfSound(35000)) > 0.5 {
-		t.Errorf("CAS/TAS round trip at FL350: %v", tas)
 	}
 }

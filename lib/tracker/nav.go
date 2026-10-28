@@ -4,12 +4,13 @@ import (
 	"math"
 	"time"
 
-	"kreklow.us/go/go-adsb/adsb"
+	"plane.watch/lib/tracker/mode_s"
 )
 
 // Navigation (TC29 target state, BDS 4,0) and enhanced surveillance (BDS 5,0
-// and 6,0) fields held on a Plane. They are decoded with go-adsb in commb.go;
-// this file holds the values and the rules for accepting them.
+// and 6,0) fields held on a Plane. They are decoded in lib/tracker/mode_s
+// (decode-adsb.go, decode-bds.go); this file holds the values and the rules
+// for accepting them, which need state the decoder does not have.
 
 const (
 	// navExpiry is how long a nav or EHS value stays current without being
@@ -158,42 +159,55 @@ func (p *Plane) ehsCurrentLocked() bool {
 
 // setTargetState takes a TC29 subtype 1 message as it comes. A field the
 // message does not carry (nil) is not a change and leaves the old value.
-func (p *Plane) setTargetState(ts *adsb.TargetState, t time.Time) bool {
+func (p *Plane) setTargetState(ts *mode_s.TargetState, t time.Time) bool {
 	if ts == nil || t.IsZero() {
 		return false
 	}
 	p.rwLock.Lock()
 	defer p.rwLock.Unlock()
 	var changed bool
-	if ts.SelectedAltitude != nil {
-		if ts.SelectedAltitudeFMS {
-			changed = setIntPtr(&p.nav.state.SelectedAltitudeFMS, *ts.SelectedAltitude) || changed
-		} else {
-			changed = setIntPtr(&p.nav.state.SelectedAltitudeMCP, *ts.SelectedAltitude) || changed
-		}
-		p.nav.tc29TS = t
-		p.nav.tc29SelAlt = *ts.SelectedAltitude
-		p.nav.tc29FMS = ts.SelectedAltitudeFMS
+	switch {
+	case ts.SelectedAltitudeFms != nil:
+		changed = setIntPtr(&p.nav.state.SelectedAltitudeFMS, int(*ts.SelectedAltitudeFms)) || changed
+		p.nav.tc29TS, p.nav.tc29SelAlt, p.nav.tc29FMS = t, int(*ts.SelectedAltitudeFms), true
+	case ts.SelectedAltitudeMcp != nil:
+		changed = setIntPtr(&p.nav.state.SelectedAltitudeMCP, int(*ts.SelectedAltitudeMcp)) || changed
+		p.nav.tc29TS, p.nav.tc29SelAlt, p.nav.tc29FMS = t, int(*ts.SelectedAltitudeMcp), false
 	}
-	if ts.BarometricPressureSetting != nil {
-		changed = setFloatPtr(&p.nav.state.QNH, *ts.BarometricPressureSetting) || changed
+	if ts.BaroSetting != nil {
+		changed = setFloatPtr(&p.nav.state.QNH, *ts.BaroSetting) || changed
 	}
 	if ts.SelectedHeading != nil {
 		changed = setFloatPtr(&p.nav.state.SelectedHeading, *ts.SelectedHeading) || changed
 	}
-	if ts.ModeBitsValid {
-		modes := NavModes{
-			Autopilot: ts.AutopilotEngaged,
-			VNAV:      ts.VNAVEngaged,
-			LNAV:      ts.LNAVEngaged,
-			AltHold:   ts.AltitudeHold,
-			Approach:  ts.ApproachMode,
-			TCAS:      ts.TCASOperational,
+	if ts.NavModes != nil {
+		modes := navModesFrom(*ts.NavModes)
+		if ts.TcasOperational != nil {
+			modes.TCAS = *ts.TcasOperational
 		}
 		changed = setModes(&p.nav.state.Modes, modes) || changed
 	}
 	p.nav.ts = t
 	return changed
+}
+
+// navModesFrom converts the decoder's mode flags.
+func navModesFrom(m mode_s.NavModes) NavModes {
+	return NavModes{
+		Autopilot: m&mode_s.NavModeAutopilot != 0,
+		VNAV:      m&mode_s.NavModeVNAV != 0,
+		LNAV:      m&mode_s.NavModeLNAV != 0,
+		AltHold:   m&mode_s.NavModeAltHold != 0,
+		Approach:  m&mode_s.NavModeApproach != 0,
+	}
+}
+
+func i32p(v *int32) *int {
+	if v == nil {
+		return nil
+	}
+	i := int(*v)
+	return &i
 }
 
 // setBds40 takes an inferred BDS 4,0 (selected vertical intention) reply.
@@ -203,24 +217,25 @@ func (p *Plane) setTargetState(ts *adsb.TargetState, t time.Time) bool {
 // same values have been seen twice. While TC29 is current the reply adds
 // only what TC29 lacks (the FMS altitude); without TC29, as on ADS-B
 // version 0 aircraft, it supplies everything.
-func (p *Plane) setBds40(svi *adsb.SelectedVerticalIntention, t time.Time) bool {
-	if svi == nil || t.IsZero() {
+func (p *Plane) setBds40(b *mode_s.Bds40, t time.Time) bool {
+	if b == nil || t.IsZero() {
 		return false
 	}
-	if svi.MCPSelectedAltitude == nil && svi.FMSSelectedAltitude == nil && svi.BarometricPressureSetting == nil {
+	mcp, fms := i32p(b.SelectedAltitudeMcp), i32p(b.SelectedAltitudeFms)
+	if mcp == nil && fms == nil && b.BaroSetting == nil {
 		return false
 	}
 	p.rwLock.Lock()
 	defer p.rwLock.Unlock()
 
-	reading := &bds40Reading{mcp: svi.MCPSelectedAltitude, fms: svi.FMSSelectedAltitude, qnh: svi.BarometricPressureSetting, ts: t}
+	reading := &bds40Reading{mcp: mcp, fms: fms, qnh: b.BaroSetting, ts: t}
 	tc29Current := !p.nav.tc29TS.IsZero() && t.Sub(p.nav.tc29TS) <= navExpiry && t.Sub(p.nav.tc29TS) >= -navExpiry
 	accepted := false
 	if tc29Current {
 		if p.nav.tc29FMS {
-			accepted = svi.FMSSelectedAltitude != nil && near(*svi.FMSSelectedAltitude, p.nav.tc29SelAlt, selectedAltitudeTolerance)
+			accepted = fms != nil && near(*fms, p.nav.tc29SelAlt, selectedAltitudeTolerance)
 		} else {
-			accepted = svi.MCPSelectedAltitude != nil && near(*svi.MCPSelectedAltitude, p.nav.tc29SelAlt, selectedAltitudeTolerance)
+			accepted = mcp != nil && near(*mcp, p.nav.tc29SelAlt, selectedAltitudeTolerance)
 		}
 	}
 	if !accepted && p.nav.last40 != nil && t.Sub(p.nav.last40.ts) <= navExpiry && p.nav.last40.sameValues(reading) {
@@ -232,18 +247,20 @@ func (p *Plane) setBds40(svi *adsb.SelectedVerticalIntention, t time.Time) bool 
 	}
 
 	var changed bool
-	if svi.FMSSelectedAltitude != nil {
-		changed = setIntPtr(&p.nav.state.SelectedAltitudeFMS, *svi.FMSSelectedAltitude) || changed
+	if fms != nil {
+		changed = setIntPtr(&p.nav.state.SelectedAltitudeFMS, *fms) || changed
 	}
 	if !tc29Current {
-		if svi.MCPSelectedAltitude != nil {
-			changed = setIntPtr(&p.nav.state.SelectedAltitudeMCP, *svi.MCPSelectedAltitude) || changed
+		if mcp != nil {
+			changed = setIntPtr(&p.nav.state.SelectedAltitudeMCP, *mcp) || changed
 		}
-		if svi.BarometricPressureSetting != nil {
-			changed = setFloatPtr(&p.nav.state.QNH, *svi.BarometricPressureSetting) || changed
+		if b.BaroSetting != nil {
+			changed = setFloatPtr(&p.nav.state.QNH, *b.BaroSetting) || changed
 		}
-		if svi.ModeBitsValid {
-			modes := NavModes{VNAV: svi.VNAVMode, AltHold: svi.AltitudeHold, Approach: svi.ApproachMode}
+		if b.NavModes != nil {
+			// 4,0 carries VNAV, altitude hold and approach only; keep the
+			// rest from the last TC29.
+			modes := navModesFrom(*b.NavModes)
 			if p.nav.state.Modes != nil {
 				modes.Autopilot = p.nav.state.Modes.Autopilot
 				modes.LNAV = p.nav.state.Modes.LNAV
@@ -261,21 +278,21 @@ func (r *bds40Reading) sameValues(o *bds40Reading) bool {
 }
 
 // setBds50 takes a BDS 5,0 (track and turn) reply that is known to be one.
-func (p *Plane) setBds50(tt *adsb.TrackAndTurn, t time.Time) bool {
-	if tt == nil || t.IsZero() {
+func (p *Plane) setBds50(b *mode_s.Bds50, t time.Time) bool {
+	if b == nil || t.IsZero() {
 		return false
 	}
 	p.rwLock.Lock()
 	defer p.rwLock.Unlock()
 	var changed bool
-	if tt.RollAngle != nil {
-		changed = setFloatPtr(&p.ehs.state.Roll, *tt.RollAngle) || changed
+	if b.Roll != nil {
+		changed = setFloatPtr(&p.ehs.state.Roll, *b.Roll) || changed
 	}
-	if tt.TrackAngleRate != nil {
-		changed = setFloatPtr(&p.ehs.state.TrackRate, *tt.TrackAngleRate) || changed
+	if b.TrackRate != nil {
+		changed = setFloatPtr(&p.ehs.state.TrackRate, *b.TrackRate) || changed
 	}
-	if tt.TrueAirspeed != nil {
-		changed = setIntPtr(&p.ehs.state.TAS, int(math.Round(*tt.TrueAirspeed))) || changed
+	if b.TrueAirspeed != nil {
+		changed = setIntPtr(&p.ehs.state.TAS, int(math.Round(*b.TrueAirspeed))) || changed
 	}
 	// Ground speed and true track duplicate TC19 and are not kept.
 	p.ehs.ts = t
@@ -283,30 +300,56 @@ func (p *Plane) setBds50(tt *adsb.TrackAndTurn, t time.Time) bool {
 }
 
 // setBds60 takes a BDS 6,0 (heading and speed) reply that is known to be one.
-func (p *Plane) setBds60(hs *adsb.HeadingAndSpeed, t time.Time) bool {
-	if hs == nil || t.IsZero() {
+func (p *Plane) setBds60(b *mode_s.Bds60, t time.Time) bool {
+	if b == nil || t.IsZero() {
 		return false
 	}
 	p.rwLock.Lock()
 	defer p.rwLock.Unlock()
 	var changed bool
-	if hs.MagneticHeading != nil {
-		changed = setFloatPtr(&p.ehs.state.MagneticHeading, *hs.MagneticHeading) || changed
+	if b.MagneticHeading != nil {
+		changed = setFloatPtr(&p.ehs.state.MagneticHeading, *b.MagneticHeading) || changed
 	}
-	if hs.IndicatedAirspeed != nil {
-		changed = setIntPtr(&p.ehs.state.IAS, int(math.Round(*hs.IndicatedAirspeed))) || changed
+	if b.IndicatedAirspeed != nil {
+		changed = setIntPtr(&p.ehs.state.IAS, int(math.Round(*b.IndicatedAirspeed))) || changed
 	}
-	if hs.Mach != nil {
-		changed = setFloatPtr(&p.ehs.state.Mach, *hs.Mach) || changed
+	if b.Mach != nil {
+		changed = setFloatPtr(&p.ehs.state.Mach, *b.Mach) || changed
 	}
-	if hs.BarometricAltitudeRate != nil {
-		changed = setIntPtr(&p.ehs.state.BaroVerticalRate, *hs.BarometricAltitudeRate) || changed
+	if b.BaroVerticalRate != nil {
+		changed = setIntPtr(&p.ehs.state.BaroVerticalRate, int(math.Round(*b.BaroVerticalRate))) || changed
 	}
-	if hs.InertialVerticalVelocity != nil {
-		changed = setIntPtr(&p.ehs.state.InertialVerticalRate, *hs.InertialVerticalVelocity) || changed
+	if b.InertialVerticalRate != nil {
+		changed = setIntPtr(&p.ehs.state.InertialVerticalRate, int(math.Round(*b.InertialVerticalRate))) || changed
 	}
 	p.ehs.ts = t
 	return changed
+}
+
+// knownState is what the tracker tells the decoder about the aircraft so
+// that a DF20/21 reply reading as both BDS 5,0 and 6,0 can be settled: the
+// TC19 ground speed and track when they are within velocityResolveWindow
+// of t, and the altitude.
+func (p *Plane) knownState(t time.Time) mode_s.KnownState {
+	p.rwLock.RLock()
+	defer p.rwLock.RUnlock()
+	k := mode_s.KnownState{}
+	if p.location.hasVelocity && p.location.hasHeading && !p.location.velocityTS.IsZero() {
+		age := t.Sub(p.location.velocityTS)
+		if age < 0 {
+			age = -age
+		}
+		if age <= velocityResolveWindow {
+			k.HasVelocity = true
+			k.GroundSpeed = p.location.velocity
+			k.Track = p.location.heading
+		}
+	}
+	if !p.location.altitudeTS.IsZero() {
+		k.HasAltitude = true
+		k.AltitudeFt = float64(p.location.altitude)
+	}
+	return k
 }
 
 func setIntPtr(dst **int, v int) bool {

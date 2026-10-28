@@ -33,7 +33,6 @@ require (
 	golang.org/x/exp v0.0.0-20260212183809-81e46e3db34a
 	golang.org/x/net v0.47.0
 	golang.org/x/sync v0.19.0
-	kreklow.us/go/go-adsb v0.0.0
 )
 
 require (
@@ -41,7 +40,6 @@ require (
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/ccoveille/go-safecast/v2 v2.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/charmbracelet/colorprofile v0.3.3 // indirect
 	github.com/charmbracelet/x/ansi v0.11.2 // indirect
@@ -93,8 +91,3 @@ require (
 	google.golang.org/protobuf v1.36.8 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-// Shane Short's go-adsb fork keeps upstream's module path and has no tags,
-// so it is pinned by replace at the commit the decoder adapter was tested
-// against (lib/tracker/commb.go).
-replace kreklow.us/go/go-adsb => github.com/shaneshort/go-adsb v0.0.0-20260727115324-78c5e1a0bb76
