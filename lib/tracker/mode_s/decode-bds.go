@@ -99,11 +99,13 @@ func (f *Frame) decodeCommB() error {
 	case BdsEhsSelVertIntent: // 4.0, sole candidate
 		f.targetState = f.commB.B40.targetState()
 	case BdsElsDataLinkCap: // 1.0
-		// decode capability
+		f.dataLink = decodeBds10(f.message[4:11])
 	case BdsElsGicbCap: // 1.7
-		// decode GICB
+		f.gicb = decodeBds17(f.message[4:11])
 	case BdsElsAircraftIdent: // 2.0
 		f.decodeFlightNumber()
+	case BdsElsAcasRA: // 3.0
+		f.acasRA = decodeBds30(f.message[4:11])
 	}
 
 	// things get a lot murkier from here on in!
@@ -189,6 +191,195 @@ func inferCommBMessageType(mb []byte) (byte, byte, error) {
 	// TODO: Implement MRAR and MHR
 
 	return 0, 0, ErrUnknownCommBMessage
+}
+
+// Comm-B Elementary Surveillance (ELS) registers: BDS 1,0, 1,7 and 3,0.
+// 2,0 is the callsign, read by decodeFlightNumber. Bit numbers are within
+// the 56-bit MB field; layouts from ICAO Doc 9871 tables A-2-16, A-2-23
+// and A-2-48, checked against pyModeS.
+
+// DataLinkCapability is the BDS 1,0 report: what the transponder can do.
+type DataLinkCapability struct {
+	Continuation          bool // another capability register follows
+	OverlayCommand        bool // overlay command capability
+	AcasOperational       bool
+	SubnetworkVersion     uint8 // Mode S subnetwork version number
+	EnhancedProtocol      bool  // level 5 transponder
+	SpecificServices      bool  // Mode S specific services
+	UplinkElmThroughput   uint8
+	DownlinkElmThroughput uint8
+	AircraftIdent         bool // can report BDS 2,0
+	Squitter              bool // squitter capability subfield
+	SurveillanceIdent     bool // surveillance identifier code
+	CommonUsageGicb       bool // can report BDS 1,7
+	AcasHybridSurv        bool
+	AcasGeneratesRA       bool // ACAS generating TAs and RAs
+	AcasVersion           uint8
+	DteStatus             uint16
+}
+
+// GicbCapability is the BDS 1,7 report: which common-usage registers the
+// transponder will answer a ground interrogation with. Codes are in "4.0"
+// form, the same as BdsMessageType.
+type GicbCapability struct {
+	Supported []string
+}
+
+// Has reports whether the aircraft says it supports a register.
+func (g *GicbCapability) Has(code string) bool {
+	if g == nil {
+		return false
+	}
+	for _, c := range g.Supported {
+		if c == code {
+			return true
+		}
+	}
+	return false
+}
+
+// AcasRA is the BDS 3,0 report: the resolution advisory ACAS is issuing.
+type AcasRA struct {
+	Active           bool // an RA is active (ARA bit 1)
+	Corrective       bool
+	DownwardSense    bool
+	IncreasedRate    bool
+	SenseReversal    bool
+	AltitudeCrossing bool
+	Positive         bool
+	NoBelow          bool // RA complement: do not pass below
+	NoAbove          bool
+	NoLeft           bool
+	NoRight          bool
+	Terminated       bool
+	MultipleThreats  bool
+	ThreatType       uint8 // 0 none, 1 identified by ICAO, 2 by altitude, range and bearing
+
+	ThreatIcao    uint32   // type 1
+	ThreatAltFt   *int32   // type 2, Mode C altitude
+	ThreatRangeNm *float64 // type 2
+	ThreatBearing *float64 // type 2, degrees relative to own heading
+}
+
+// gicbRegisters is the BDS 1,7 bit map, bit 1 first (Doc 9871 A-2-23).
+var gicbRegisters = []string{
+	"0.5", "0.6", "0.7", "0.8", "0.9", "0.A", "2.0", "2.1",
+	"4.0", "4.1", "4.2", "4.3", "4.4", "4.5", "4.8",
+	"5.0", "5.1", "5.2", "5.3", "5.4", "5.5", "5.6", "5.F", "6.0",
+}
+
+func bit(mb []byte, n int) bool { return bitsAt(mb, n, n) == 1 }
+
+func decodeBds10(mb []byte) *DataLinkCapability {
+	return &DataLinkCapability{
+		Continuation:          bit(mb, 9),
+		OverlayCommand:        bit(mb, 15),
+		AcasOperational:       bit(mb, 16),
+		SubnetworkVersion:     uint8(bitsAt(mb, 17, 23)),
+		EnhancedProtocol:      bit(mb, 24),
+		SpecificServices:      bit(mb, 25),
+		UplinkElmThroughput:   uint8(bitsAt(mb, 26, 28)),
+		DownlinkElmThroughput: uint8(bitsAt(mb, 29, 32)),
+		AircraftIdent:         bit(mb, 33),
+		Squitter:              bit(mb, 34),
+		SurveillanceIdent:     bit(mb, 35),
+		CommonUsageGicb:       bit(mb, 36),
+		AcasHybridSurv:        bit(mb, 37),
+		AcasGeneratesRA:       bit(mb, 38),
+		AcasVersion:           uint8(bitsAt(mb, 39, 40)),
+		DteStatus:             uint16(bitsAt(mb, 41, 56)),
+	}
+}
+
+func decodeBds17(mb []byte) *GicbCapability {
+	g := &GicbCapability{}
+	for i, code := range gicbRegisters {
+		if bit(mb, i+1) {
+			g.Supported = append(g.Supported, code)
+		}
+	}
+	return g
+}
+
+func decodeBds30(mb []byte) *AcasRA {
+	ra := &AcasRA{
+		Active:           bit(mb, 9),
+		Corrective:       bit(mb, 10),
+		DownwardSense:    bit(mb, 11),
+		IncreasedRate:    bit(mb, 12),
+		SenseReversal:    bit(mb, 13),
+		AltitudeCrossing: bit(mb, 14),
+		Positive:         bit(mb, 15),
+		NoBelow:          bit(mb, 23),
+		NoAbove:          bit(mb, 24),
+		NoLeft:           bit(mb, 25),
+		NoRight:          bit(mb, 26),
+		Terminated:       bit(mb, 27),
+		MultipleThreats:  bit(mb, 28),
+		ThreatType:       uint8(bitsAt(mb, 29, 30)),
+	}
+	switch ra.ThreatType {
+	case 1:
+		ra.ThreatIcao = uint32(bitsAt(mb, 31, 54))
+	case 2:
+		// 31-43: Mode C altitude code; 44-50: range, (n-1)/10 NM, 0 = no
+		// data, 127 = beyond 12.55 NM; 51-56: bearing, 6(n-1)+3 degrees,
+		// 0 = no data, 61-63 invalid.
+		if alt, ok := decodeAC13Feet(uint32(bitsAt(mb, 31, 43))); ok {
+			ra.ThreatAltFt = &alt
+		}
+		if n := bitsAt(mb, 44, 50); n != 0 {
+			r := float64(n-1) / 10
+			ra.ThreatRangeNm = &r
+		}
+		if n := bitsAt(mb, 51, 56); n != 0 && n <= 60 {
+			b := float64(6*(n-1) + 3)
+			ra.ThreatBearing = &b
+		}
+	}
+	return ra
+}
+
+// decodeAC13Feet reads a 13-bit Mode C altitude code (DF4/20 layout: M at
+// bit 7, Q at bit 9 of the field) in feet. Zero, metres and an invalid
+// Gillham code give ok=false.
+func decodeAC13Feet(ac uint32) (int32, bool) {
+	if ac == 0 || ac&0x40 != 0 {
+		return 0, false
+	}
+	if ac&0x10 != 0 {
+		n := int32(((ac & 0x1F80) >> 2) | ((ac & 0x0020) >> 1) | (ac & 0x000F))
+		return n*25 - 1000, true
+	}
+	n := modeAToModeC(decodeID13Field(int32(ac)))
+	if n < -12 {
+		return 0, false
+	}
+	return n * 100, true
+}
+
+// DataLinkCapability returns the BDS 1,0 report carried by this frame, or nil.
+func (f *Frame) DataLinkCapability() *DataLinkCapability {
+	if f == nil {
+		return nil
+	}
+	return f.dataLink
+}
+
+// GicbCapability returns the BDS 1,7 report carried by this frame, or nil.
+func (f *Frame) GicbCapability() *GicbCapability {
+	if f == nil {
+		return nil
+	}
+	return f.gicb
+}
+
+// AcasRA returns the BDS 3,0 report carried by this frame, or nil.
+func (f *Frame) AcasRA() *AcasRA {
+	if f == nil {
+		return nil
+	}
+	return f.acasRA
 }
 
 // Comm-B Enhanced Surveillance (EHS) registers: BDS 4,0, 5,0 and 6,0.
@@ -473,6 +664,7 @@ type KnownState struct {
 	HasVelocity bool
 	AltitudeFt  float64
 	HasAltitude bool
+	Gicb        *GicbCapability // the aircraft's BDS 1,7 report, if heard
 }
 
 // ResolveCommB settles a DF20/21 reply that could be either BDS 5,0 or 6,0
@@ -508,6 +700,25 @@ func ResolveCommB(c *CommB, k KnownState) string {
 	}
 	if len(c.Candidates) == 1 {
 		return c.Candidates[0]
+	}
+	// A register the aircraft says it does not support is not a candidate.
+	if k.Gicb != nil {
+		var kept []string
+		for _, code := range c.Candidates {
+			if k.Gicb.Has(code) {
+				kept = append(kept, code)
+			}
+		}
+		switch len(kept) {
+		case 0:
+			return ""
+		case 1:
+			return kept[0]
+		}
+		c = &CommB{Candidates: kept, B40: c.B40, B50: c.B50, B60: c.B60}
+		if !k.Gicb.Has(BdsEhsSelVertIntent) {
+			c.B40 = nil
+		}
 	}
 	if c.B50 == nil || c.B60 == nil || c.B40 != nil || !k.HasVelocity {
 		return ""

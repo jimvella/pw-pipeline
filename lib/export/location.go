@@ -74,6 +74,9 @@ func NewPlaneLocation(plane *tracker.Plane, isNew, isRemoved bool, source string
 		pl.Mach = ehs.Mach
 		pl.Roll = ehs.Roll
 		pl.MagHeading = ehs.MagneticHeading
+		pl.TrackRate = ehs.TrackRate
+		pl.BaroRate = ehs.BaroVerticalRate
+		pl.GeomRate = ehs.InertialVerticalRate
 	}
 	return pl
 }

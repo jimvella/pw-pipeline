@@ -263,6 +263,15 @@ components:
           MagHeading:
             type: number
             description: 'Magnetic heading, degrees, from Comm-B BDS 6,0.'
+          TrackRate:
+            type: number
+            description: 'Rate of turn, degrees per second, positive to the right, from Comm-B BDS 5,0.'
+          BaroRate:
+            type: integer
+            description: 'Barometric vertical rate, ft/min, from Comm-B BDS 6,0.'
+          GeomRate:
+            type: integer
+            description: 'Inertial vertical rate, ft/min, from Comm-B BDS 6,0.'
       examples:
         - name: Example Payload
           payload:

@@ -417,10 +417,14 @@ func (p *Plane) HandleModeSFrame(frame *mode_s.Frame, source *FrameSource) {
 		switch frame.BdsMessageType() {
 		case mode_s.BdsElsDataLinkCap: // 1.0
 			hasChanged = p.setSquawkIdentity(frame.SquawkIdentity(), frame.TimeStamp()) || hasChanged
+			p.setDataLink(frame.DataLinkCapability(), frame.TimeStamp())
 		case mode_s.BdsElsGicbCap: // 1.7
 			if frame.AltitudeValid() {
 				hasChanged = p.setAltitude(frame.MustAltitude(), frame.AltitudeUnits(), frame.TimeStamp()) || hasChanged
 			}
+			p.setGicb(frame.GicbCapability(), frame.TimeStamp())
+		case mode_s.BdsElsAcasRA: // 3.0
+			p.setAcasRA(frame.AcasRA(), frame.TimeStamp())
 		case mode_s.BdsElsAircraftIdent: // 2.0
 			hasChanged = p.setFlightNumber(frame.FlightNumber()) || hasChanged
 		case mode_s.BdsEhsSelVertIntent: // 4.0
@@ -438,8 +442,7 @@ func (p *Plane) HandleModeSFrame(frame *mode_s.Frame, source *FrameSource) {
 		default:
 			// let's see if we can decode more BDS info
 			// TODO: Decode Other BDS frames: 4,3 4,4 4,5 5,1 5,2 5,3 are not
-			// inferred yet (see TestCommBRegisters in mode_s), and 1,0 / 1,7
-			// are inferred but nothing is read from them.
+			// inferred yet (see TestCommBRegisters in mode_s).
 		}
 	}
 

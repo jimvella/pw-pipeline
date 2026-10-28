@@ -75,17 +75,20 @@ func TestMergeEHS(t *testing.T) {
 	t2 := t1.Add(time.Second)
 
 	prev := PlaneLocation{IAS: ptr(200), Mach: ptr(0.4), Updates: Updates{EHS: t1}}
-	next := PlaneLocation{IAS: ptr(211), Mach: ptr(0.408), MagHeading: ptr(337.67578125), Updates: Updates{EHS: t2}}
+	next := PlaneLocation{IAS: ptr(211), Mach: ptr(0.408), MagHeading: ptr(337.67578125), TrackRate: ptr(-0.125), BaroRate: ptr(-320), GeomRate: ptr(-352), Updates: Updates{EHS: t2}}
 
 	merged, err := MergePlaneLocations(prev, next)
 	if err != nil {
 		t.Fatalf("MergePlaneLocations() error = %v", err)
 	}
-	want := PlaneLocation{IAS: ptr(211), Mach: ptr(0.408), MagHeading: ptr(337.67578125), Updates: Updates{EHS: t2}}
+	want := PlaneLocation{IAS: ptr(211), Mach: ptr(0.408), MagHeading: ptr(337.67578125), TrackRate: ptr(-0.125), BaroRate: ptr(-320), GeomRate: ptr(-352), Updates: Updates{EHS: t2}}
 	for name, pair := range map[string][2]any{
 		"IAS":        {unPtr(merged.IAS), unPtr(want.IAS)},
 		"Mach":       {unPtr(merged.Mach), unPtr(want.Mach)},
 		"MagHeading": {unPtr(merged.MagHeading), unPtr(want.MagHeading)},
+		"TrackRate":  {unPtr(merged.TrackRate), unPtr(want.TrackRate)},
+		"BaroRate":   {unPtr(merged.BaroRate), unPtr(want.BaroRate)},
+		"GeomRate":   {unPtr(merged.GeomRate), unPtr(want.GeomRate)},
 	} {
 		if !reflect.DeepEqual(pair[0], pair[1]) {
 			t.Errorf("%s = %v, want %v", name, pair[0], pair[1])
@@ -109,7 +112,7 @@ func TestNavJSONOmittedWhenAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"NavAltitudeMCP", "NavQNH", "NavModes", "IAS", "Mach", "MagHeading"} {
+	for _, field := range []string{"NavAltitudeMCP", "NavQNH", "NavModes", "IAS", "Mach", "MagHeading", "TrackRate", "BaroRate", "GeomRate"} {
 		if contains(b, field) {
 			t.Errorf("JSON carries %s for an aircraft without it: %s", field, b)
 		}

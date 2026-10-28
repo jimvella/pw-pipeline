@@ -90,6 +90,9 @@ type (
 		Mach       *float64 `json:",omitempty"`
 		Roll       *float64 `json:",omitempty"` // degrees, right wing down positive
 		MagHeading *float64 `json:",omitempty"` // degrees, magnetic heading
+		TrackRate  *float64 `json:",omitempty"` // degrees per second, positive to the right
+		BaroRate   *int     `json:",omitempty"` // ft/min, barometric vertical rate
+		GeomRate   *int     `json:",omitempty"` // ft/min, inertial vertical rate
 
 		// Enrichment Plane data
 		IcaoCode        *string `json:",omitempty"`
@@ -323,6 +326,9 @@ func MergePlaneLocations(prev, next PlaneLocation) (PlaneLocation, error) {
 		merged.Mach = next.Mach
 		merged.Roll = next.Roll
 		merged.MagHeading = next.MagHeading
+		merged.TrackRate = next.TrackRate
+		merged.BaroRate = next.BaroRate
+		merged.GeomRate = next.GeomRate
 		merged.Updates.EHS = next.Updates.EHS
 	}
 
@@ -467,7 +473,8 @@ func (pl *PlaneLocation) HasEHS() bool {
 	if nil == pl {
 		return false
 	}
-	return pl.IAS != nil || pl.TAS != nil || pl.Mach != nil || pl.Roll != nil || pl.MagHeading != nil
+	return pl.IAS != nil || pl.TAS != nil || pl.Mach != nil || pl.Roll != nil || pl.MagHeading != nil ||
+		pl.TrackRate != nil || pl.BaroRate != nil || pl.GeomRate != nil
 }
 
 func (pl *PlaneLocation) CallSignStr() string {

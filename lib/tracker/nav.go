@@ -7,10 +7,11 @@ import (
 	"plane.watch/lib/tracker/mode_s"
 )
 
-// Navigation (TC29 target state, BDS 4,0) and enhanced surveillance (BDS 5,0
-// and 6,0) fields held on a Plane. They are decoded in lib/tracker/mode_s
-// (decode-adsb.go, decode-bds.go); this file holds the values and the rules
-// for accepting them, which need state the decoder does not have.
+// Navigation (TC29 target state, BDS 4,0), enhanced surveillance (BDS 5,0
+// and 6,0) and ELS (BDS 1,0, 1,7, 3,0) fields held on a Plane. They are
+// decoded in lib/tracker/mode_s (decode-adsb.go, decode-bds.go); this file
+// holds the values and the rules for accepting them, which need state the
+// decoder does not have.
 
 const (
 	// navExpiry is how long a nav or EHS value stays current without being
@@ -86,7 +87,66 @@ type (
 		state EhsState
 		ts    time.Time
 	}
+
+	// elsTracking holds the ELS capability and ACAS reports. The
+	// capabilities describe the transponder and do not expire; the RA is
+	// kept with the time it was last reported.
+	elsTracking struct {
+		dataLink *mode_s.DataLinkCapability
+		gicb     *mode_s.GicbCapability
+		acasRA   *mode_s.AcasRA
+		acasRATS time.Time
+	}
 )
+
+// DataLinkCapability returns the aircraft's BDS 1,0 report, or nil.
+func (p *Plane) DataLinkCapability() *mode_s.DataLinkCapability {
+	p.rwLock.RLock()
+	defer p.rwLock.RUnlock()
+	return p.els.dataLink
+}
+
+// GicbCapability returns the aircraft's BDS 1,7 report, or nil.
+func (p *Plane) GicbCapability() *mode_s.GicbCapability {
+	p.rwLock.RLock()
+	defer p.rwLock.RUnlock()
+	return p.els.gicb
+}
+
+// AcasRA returns the last BDS 3,0 report and when it was heard.
+func (p *Plane) AcasRA() (*mode_s.AcasRA, time.Time) {
+	p.rwLock.RLock()
+	defer p.rwLock.RUnlock()
+	return p.els.acasRA, p.els.acasRATS
+}
+
+func (p *Plane) setDataLink(d *mode_s.DataLinkCapability, t time.Time) {
+	if d == nil {
+		return
+	}
+	p.rwLock.Lock()
+	defer p.rwLock.Unlock()
+	p.els.dataLink = d
+}
+
+func (p *Plane) setGicb(g *mode_s.GicbCapability, t time.Time) {
+	if g == nil {
+		return
+	}
+	p.rwLock.Lock()
+	defer p.rwLock.Unlock()
+	p.els.gicb = g
+}
+
+func (p *Plane) setAcasRA(ra *mode_s.AcasRA, t time.Time) {
+	if ra == nil {
+		return
+	}
+	p.rwLock.Lock()
+	defer p.rwLock.Unlock()
+	p.els.acasRA = ra
+	p.els.acasRATS = t
+}
 
 // Strings gives the modes in readsb's nav_modes names.
 func (m NavModes) Strings() []string {
@@ -349,6 +409,7 @@ func (p *Plane) knownState(t time.Time) mode_s.KnownState {
 		k.HasAltitude = true
 		k.AltitudeFt = float64(p.location.altitude)
 	}
+	k.Gicb = p.els.gicb
 	return k
 }
 

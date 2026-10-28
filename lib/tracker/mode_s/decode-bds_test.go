@@ -85,7 +85,6 @@ func Test_inferCommBMessageType(t *testing.T) {
 // carrying that register:
 //
 //   - decoded:     the register is inferred and its fields are read
-//   - recognised:  the register is inferred but nothing is read from it
 //   - unsupported: the decoder never infers it; the reply comes out unknown
 //
 // Real replies were heard near Perth on 2026-10-22 and their values checked
@@ -101,15 +100,57 @@ func TestCommBRegisters(t *testing.T) {
 		mb      string // 7-byte MB field, synthetic rows
 		check   func(t *testing.T, f *Frame)
 	}{
-		{bds: BdsElsDataLinkCap, support: "recognised", msg: "a00001b310020a80e000005de699"},
-		{bds: BdsElsGicbCap, support: "recognised", msg: "a00003b3fe01e10000000096530c"},
+		{bds: BdsElsDataLinkCap, support: "decoded", msg: "a00001b310020a80e000005de699",
+			check: func(t *testing.T, f *Frame) {
+				got := f.DataLinkCapability()
+				want := &DataLinkCapability{
+					OverlayCommand: true, SubnetworkVersion: 5, SpecificServices: true,
+					AircraftIdent: true, Squitter: true, SurveillanceIdent: true,
+				}
+				if got == nil || *got != *want {
+					t.Errorf("data link capability\n got %+v\nwant %+v", got, want)
+				}
+			}},
+		{bds: BdsElsGicbCap, support: "decoded", msg: "a00003b3fe01e10000000096530c",
+			check: func(t *testing.T, f *Frame) {
+				g := f.GicbCapability()
+				want := []string{"0.5", "0.6", "0.7", "0.8", "0.9", "0.A", "2.0", "5.0", "5.1", "5.2", "5.3", "6.0"}
+				if g == nil || strings.Join(g.Supported, " ") != strings.Join(want, " ") {
+					t.Errorf("supported registers %v, want %v", g, want)
+				}
+				if g.Has(BdsEhsSelVertIntent) || !g.Has(BdsEhsHeadingSpeed) {
+					t.Errorf("Has: 4,0 %v 6,0 %v", g.Has(BdsEhsSelVertIntent), g.Has(BdsEhsHeadingSpeed))
+				}
+			}},
 		{bds: BdsElsAircraftIdent, support: "decoded", msg: "a8000489200d4cb0ca08207b5f82",
 			check: func(t *testing.T, f *Frame) {
 				if strings.TrimSpace(f.FlightNumber()) != "CT202" {
 					t.Errorf("callsign %q, want CT202", f.FlightNumber())
 				}
 			}},
-		{bds: BdsElsAcasRA, support: "recognised", mb: "30fe3c08ffffff"}, // the field from Test_inferCommBMessageType
+		// The two fields from Test_inferCommBMessageType: a threat given by
+		// altitude, range and bearing, and one given by ICAO address.
+		{bds: BdsElsAcasRA, support: "decoded", mb: "30fe3c08ffffff",
+			check: func(t *testing.T, f *Frame) {
+				ra := f.AcasRA()
+				if ra == nil || !ra.Active || !ra.Corrective || !ra.DownwardSense || !ra.Positive || ra.NoBelow || ra.Terminated || ra.MultipleThreats {
+					t.Fatalf("RA %+v", ra)
+				}
+				if ra.ThreatType != 2 || ra.ThreatAltFt != nil {
+					t.Errorf("threat type %d, altitude %v (code 0x0400 is not a valid Gillham code)", ra.ThreatType, ra.ThreatAltFt)
+				}
+				near(t, "threat range", ra.ThreatRangeNm, 12.6, 1e-9)
+				if ra.ThreatBearing != nil {
+					t.Errorf("threat bearing %v from code 63, want not available", *ra.ThreatBearing)
+				}
+			}},
+		{bds: BdsElsAcasRA, support: "decoded", mb: "30fe4c04ffffff",
+			check: func(t *testing.T, f *Frame) {
+				ra := f.AcasRA()
+				if ra == nil || ra.ThreatType != 1 || ra.ThreatIcao != 0x3FFFFF {
+					t.Errorf("RA %+v, want threat ICAO 3FFFFF", ra)
+				}
+			}},
 		{bds: BdsEhsSelVertIntent, support: "decoded", msg: "a8000489aaf80030a400003ac636",
 			check: func(t *testing.T, f *Frame) {
 				ts := f.TargetState()
@@ -180,13 +221,6 @@ func TestCommBRegisters(t *testing.T) {
 					t.Fatalf("inferred %s, want %s", f.BdsMessageType(), tt.bds)
 				}
 				tt.check(t, f)
-			case "recognised":
-				if f.BdsMessageType() != tt.bds {
-					t.Fatalf("inferred %s, want %s", f.BdsMessageType(), tt.bds)
-				}
-				if f.CommB() != nil || f.TargetState() != nil {
-					t.Errorf("values read from a register that is only recognised: %+v %+v", f.CommB(), f.TargetState())
-				}
 			case "unsupported":
 				if f.BdsMessageType() != "0.0" || f.CommB() != nil {
 					t.Errorf("inferred %s with candidates %+v, want unknown", f.BdsMessageType(), f.CommB())
@@ -360,10 +394,43 @@ func TestResolveCommB50Or60(t *testing.T) {
 	if got := ResolveCommB(c, KnownState{}); got != "" {
 		t.Errorf("with no state: %q, want undecided", got)
 	}
+	// The aircraft's BDS 1,7 can settle it without a velocity.
+	only60 := &GicbCapability{Supported: []string{"2.0", "4.0", "6.0"}}
+	if got := ResolveCommB(c, KnownState{Gicb: only60}); got != BdsEhsHeadingSpeed {
+		t.Errorf("with 1,7 lacking 5,0: %q, want 6.0", got)
+	}
+	neither := &GicbCapability{Supported: []string{"2.0"}}
+	if got := ResolveCommB(c, KnownState{Gicb: neither}); got != "" {
+		t.Errorf("with 1,7 lacking both: %q, want undecided", got)
+	}
 }
 
-// A reply that reads as BDS 4,0 with a selected altitude of 40,992 ft from an
-// aircraft at 775 ft, and also as 6,0. It must not become an alt bug.
+// The real three-way reply from TestCommBUndecided. Read as 5,0 it has only
+// a roll and as 6,0 only a heading, so no velocity can choose; the
+// aircraft's own BDS 1,7 can, by ruling registers out.
+func TestResolveCommBWithGicb(t *testing.T) {
+	f := decodeOrFail(t, "a000011994e00000000000026bd3")
+	c := f.CommB()
+	if c == nil || len(c.Candidates) != 3 {
+		t.Fatalf("candidates %+v", c)
+	}
+	k := KnownState{GroundSpeed: 120, Track: 200, HasVelocity: true, AltitudeFt: 825, HasAltitude: true}
+	if got := ResolveCommB(c, k); got != "" {
+		t.Errorf("without 1,7: %q, want undecided", got)
+	}
+	k.Gicb = &GicbCapability{Supported: []string{"2.0", "5.0", "6.0"}}
+	if got := ResolveCommB(c, k); got != "" {
+		t.Errorf("with 1,7 lacking 4,0, no speed either way: %q, want undecided", got)
+	}
+	k.Gicb = &GicbCapability{Supported: []string{"2.0", "6.0"}}
+	if got := ResolveCommB(c, k); got != BdsEhsHeadingSpeed {
+		t.Errorf("with 1,7 lacking 4,0 and 5,0: %q, want 6.0", got)
+	}
+	if !f.ResolveCommB(k) || f.BdsMessageType() != BdsEhsHeadingSpeed {
+		t.Errorf("frame not settled: %s", f.BdsMessageType())
+	}
+}
+
 func TestCommBAmbiguous40(t *testing.T) {
 	f := decodeOrFail(t, "a0000117d0100000000000b35c30")
 	if f.TargetState() != nil {

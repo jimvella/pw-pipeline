@@ -110,7 +110,7 @@ type Updates struct {
     Special      time.Time
     Squawk       time.Time
     Nav          time.Time  // NavAltitudeMCP, NavAltitudeFMS, NavQNH, NavHeading, NavModes
-    EHS          time.Time  // IAS, TAS, Mach, Roll, MagHeading
+    EHS          time.Time  // IAS, TAS, Mach, Roll, MagHeading, TrackRate, BaroRate, GeomRate
 }
 ```
 
@@ -165,6 +165,9 @@ TAS        *int     // 240   knots, true airspeed
 Mach       *float64 // 0.408
 Roll       *float64 // -11.25 degrees, right wing down positive
 MagHeading *float64 // 337.68 degrees, magnetic heading
+TrackRate  *float64 // -0.125 degrees per second, positive to the right
+BaroRate   *int     // -320  ft/min, barometric vertical rate
+GeomRate   *int     // -352  ft/min, inertial vertical rate
 ```
 
 **Where they come from**: `lib/tracker/mode_s` decodes them
@@ -173,8 +176,13 @@ MagHeading *float64 // 337.68 degrees, magnetic heading
 | Fields | Source |
 |---|---|
 | NavAltitudeMCP, NavAltitudeFMS, NavQNH, NavHeading, NavModes | ADS-B target state and status, type code 29 subtype 1 (DO-260B); Comm-B BDS 4,0 for aircraft that do not send it |
-| IAS, Mach, MagHeading | Comm-B BDS 6,0 (heading and speed) |
-| TAS, Roll | Comm-B BDS 5,0 (track and turn) |
+| IAS, Mach, MagHeading, BaroRate, GeomRate | Comm-B BDS 6,0 (heading and speed) |
+| TAS, Roll, TrackRate | Comm-B BDS 5,0 (track and turn) |
+
+The ELS registers are read too but not sent: BDS 1,0 (data link
+capability) and 3,0 (the active ACAS resolution advisory) are kept on the
+`Plane`, and 1,7 (which registers the transponder supports) is used to
+rule out EHS candidates before the velocity rule is tried.
 
 Comm-B replies do not say which register they carry, so the tracker only
 uses a register it is sure of: an inferred BDS 4,0 must agree with a
