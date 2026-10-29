@@ -1,7 +1,6 @@
 package tracker
 
 import (
-	"math"
 	"time"
 
 	"plane.watch/lib/tracker/mode_s"
@@ -352,7 +351,7 @@ func (p *Plane) setBds50(b *mode_s.Bds50, t time.Time) bool {
 		changed = setFloatPtr(&p.ehs.state.TrackRate, *b.TrackRate) || changed
 	}
 	if b.TrueAirspeed != nil {
-		changed = setIntPtr(&p.ehs.state.TAS, int(math.Round(*b.TrueAirspeed))) || changed
+		changed = setIntPtr(&p.ehs.state.TAS, *b.TrueAirspeed) || changed
 	}
 	// Ground speed and true track duplicate TC19 and are not kept.
 	p.ehs.ts = t
@@ -371,16 +370,16 @@ func (p *Plane) setBds60(b *mode_s.Bds60, t time.Time) bool {
 		changed = setFloatPtr(&p.ehs.state.MagneticHeading, *b.MagneticHeading) || changed
 	}
 	if b.IndicatedAirspeed != nil {
-		changed = setIntPtr(&p.ehs.state.IAS, int(math.Round(*b.IndicatedAirspeed))) || changed
+		changed = setIntPtr(&p.ehs.state.IAS, *b.IndicatedAirspeed) || changed
 	}
 	if b.Mach != nil {
 		changed = setFloatPtr(&p.ehs.state.Mach, *b.Mach) || changed
 	}
 	if b.BaroVerticalRate != nil {
-		changed = setIntPtr(&p.ehs.state.BaroVerticalRate, int(math.Round(*b.BaroVerticalRate))) || changed
+		changed = setIntPtr(&p.ehs.state.BaroVerticalRate, *b.BaroVerticalRate) || changed
 	}
 	if b.InertialVerticalRate != nil {
-		changed = setIntPtr(&p.ehs.state.InertialVerticalRate, int(math.Round(*b.InertialVerticalRate))) || changed
+		changed = setIntPtr(&p.ehs.state.InertialVerticalRate, *b.InertialVerticalRate) || changed
 	}
 	p.ehs.ts = t
 	return changed
@@ -393,7 +392,10 @@ func (p *Plane) setBds60(b *mode_s.Bds60, t time.Time) bool {
 func (p *Plane) knownState(t time.Time) mode_s.KnownState {
 	p.rwLock.RLock()
 	defer p.rwLock.RUnlock()
-	k := mode_s.KnownState{}
+	k := mode_s.KnownState{Gicb: p.els.gicb}
+	if p.location == nil {
+		return k
+	}
 	if p.location.hasVelocity && p.location.hasHeading && !p.location.velocityTS.IsZero() {
 		age := t.Sub(p.location.velocityTS)
 		if age < 0 {
@@ -409,7 +411,6 @@ func (p *Plane) knownState(t time.Time) mode_s.KnownState {
 		k.HasAltitude = true
 		k.AltitudeFt = float64(p.location.altitude)
 	}
-	k.Gicb = p.els.gicb
 	return k
 }
 

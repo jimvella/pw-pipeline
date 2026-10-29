@@ -83,6 +83,11 @@ func (f *Frame) decodeCommB() error {
 		}
 	}
 
+	// ErrUnknownCommBMessage means the reply is not an ELS register (1,0, 1,7,
+	// 2,0, 3,0), the only ones that identify themselves. The EHS registers
+	// carry no BDS code, so they can only be recognised by content: status
+	// bits, reserved bits and value ranges. More than one may fit; the
+	// tracker settles that with ResolveCommB.
 	if errors.Is(err, ErrUnknownCommBMessage) {
 		var alt *int32
 		if f.downLinkFormat == 20 && f.validAltitude && f.unit == modesUnitFeet {
@@ -325,7 +330,7 @@ func decodeBds30(mb []byte) *AcasRA {
 		// 31-43: Mode C altitude code; 44-50: range, (n-1)/10 NM, 0 = no
 		// data, 127 = beyond 12.55 NM; 51-56: bearing, 6(n-1)+3 degrees,
 		// 0 = no data, 61-63 invalid.
-		if alt, ok := decodeAC13Feet(uint32(bitsAt(mb, 31, 43))); ok {
+		if alt, ok := decodeAC13(uint32(bitsAt(mb, 31, 43))); ok {
 			ra.ThreatAltFt = &alt
 		}
 		if n := bitsAt(mb, 44, 50); n != 0 {
@@ -338,24 +343,6 @@ func decodeBds30(mb []byte) *AcasRA {
 		}
 	}
 	return ra
-}
-
-// decodeAC13Feet reads a 13-bit Mode C altitude code (DF4/20 layout: M at
-// bit 7, Q at bit 9 of the field) in feet. Zero, metres and an invalid
-// Gillham code give ok=false.
-func decodeAC13Feet(ac uint32) (int32, bool) {
-	if ac == 0 || ac&0x40 != 0 {
-		return 0, false
-	}
-	if ac&0x10 != 0 {
-		n := int32(((ac & 0x1F80) >> 2) | ((ac & 0x0020) >> 1) | (ac & 0x000F))
-		return n*25 - 1000, true
-	}
-	n := modeAToModeC(decodeID13Field(int32(ac)))
-	if n < -12 {
-		return 0, false
-	}
-	return n * 100, true
 }
 
 // DataLinkCapability returns the BDS 1,0 report carried by this frame, or nil.
@@ -409,16 +396,16 @@ type Bds50 struct {
 	TrueTrack    *float64 // degrees
 	GroundSpeed  *float64 // kt
 	TrackRate    *float64 // degrees per second
-	TrueAirspeed *float64 // kt
+	TrueAirspeed *int     // kt
 }
 
 // Bds60 is the Heading and Speed Report.
 type Bds60 struct {
 	MagneticHeading      *float64 // degrees
-	IndicatedAirspeed    *float64 // kt
+	IndicatedAirspeed    *int     // kt
 	Mach                 *float64
-	BaroVerticalRate     *float64 // ft/min
-	InertialVerticalRate *float64 // ft/min
+	BaroVerticalRate     *int // ft/min
+	InertialVerticalRate *int // ft/min
 }
 
 // CommB holds every EHS register a reply could be.
@@ -441,7 +428,7 @@ func (f *Frame) CommB() *CommB {
 // decodeEhs tests the MB field against the EHS registers. altFt is the
 // altitude from a DF20 header, or nil, for the Mach/airspeed check.
 func decodeEhs(mb []byte, altFt *int32) *CommB {
-	if allZero(mb) {
+	if [7]byte(mb) == [7]byte{} {
 		return nil
 	}
 	c := &CommB{}
@@ -462,36 +449,6 @@ func decodeEhs(mb []byte, altFt *int32) *CommB {
 	}
 	return c
 }
-
-func allZero(b []byte) bool {
-	for _, x := range b {
-		if x != 0 {
-			return false
-		}
-	}
-	return true
-}
-
-// field reads value bits first..last guarded by status bit `status`. It
-// returns ok=false when the status is clear but the value is not zero, which
-// rules the register out.
-func field(mb []byte, status, first, last int) (raw uint64, present, ok bool) {
-	raw = bitsAt(mb, first, last)
-	if bitsAt(mb, status, status) == 0 {
-		return 0, false, raw == 0
-	}
-	return raw, true, true
-}
-
-// signedField is field with a sign bit at first and magnitude first+1..last.
-func signedField(mb []byte, status, first, last int) (v int64, present, ok bool) {
-	if bitsAt(mb, status, status) == 0 {
-		return 0, false, bitsAt(mb, first, last) == 0
-	}
-	return signedBitsAt(mb, first, last), true, true
-}
-
-func f64(v float64) *float64 { return &v }
 
 func decodeBds40(mb []byte) *Bds40 {
 	// Reserved bits 40-47 and 52-53 must be zero.
@@ -525,7 +482,7 @@ func decodeBds40(mb []byte) *Bds40 {
 		b.SelectedAltitudeFms = &a
 	}
 	if hasBaro {
-		b.BaroSetting = f64(800 + float64(baro)*0.1)
+		b.BaroSetting = new(800 + float64(baro)*0.1)
 	}
 	if hasModes {
 		var m NavModes
@@ -580,16 +537,16 @@ func decodeBds50(mb []byte) *Bds50 {
 		b.GroundSpeed = &g
 	}
 	if hasRate {
-		b.TrackRate = f64(float64(rate) * 8 / 256)
+		b.TrackRate = new(float64(rate) * 8 / 256)
 	}
 	if hasTas {
-		t := float64(tas) * 2
+		t := int(tas) * 2
 		if t > 600 {
 			return nil
 		}
 		b.TrueAirspeed = &t
 	}
-	if b.GroundSpeed != nil && b.TrueAirspeed != nil && math.Abs(*b.GroundSpeed-*b.TrueAirspeed) > 200 {
+	if b.GroundSpeed != nil && b.TrueAirspeed != nil && math.Abs(*b.GroundSpeed-float64(*b.TrueAirspeed)) > 200 {
 		return nil
 	}
 	if b.Roll == nil && b.TrueTrack == nil && b.GroundSpeed == nil && b.TrackRate == nil && b.TrueAirspeed == nil {
@@ -616,7 +573,7 @@ func decodeBds60(mb []byte, altFt *int32) *Bds60 {
 		b.MagneticHeading = &h
 	}
 	if hasIas {
-		v := float64(ias)
+		v := int(ias)
 		if v > 500 {
 			return nil
 		}
@@ -630,22 +587,22 @@ func decodeBds60(mb []byte, altFt *int32) *Bds60 {
 		b.Mach = &m
 	}
 	if hasVrb {
-		v := float64(vrb) * 32
-		if math.Abs(v) > 6000 {
+		v := int(vrb) * 32
+		if v > 6000 || v < -6000 {
 			return nil
 		}
 		b.BaroVerticalRate = &v
 	}
 	if hasVri {
-		v := float64(vri) * 32
-		if math.Abs(v) > 6000 {
+		v := int(vri) * 32
+		if v > 6000 || v < -6000 {
 			return nil
 		}
 		b.InertialVerticalRate = &v
 	}
 	// IAS and Mach must agree at the reported altitude.
 	if b.IndicatedAirspeed != nil && b.Mach != nil && altFt != nil {
-		if math.Abs(*b.IndicatedAirspeed-machToCas(*b.Mach, float64(*altFt))) > 20 {
+		if math.Abs(float64(*b.IndicatedAirspeed)-machToCas(*b.Mach, float64(*altFt))) > 20 {
 			return nil
 		}
 	}
@@ -743,17 +700,22 @@ func spd50(b *Bds50) *float64 {
 	if b.GroundSpeed != nil {
 		return b.GroundSpeed
 	}
-	return b.TrueAirspeed
+	if b.TrueAirspeed != nil {
+		return new(float64(*b.TrueAirspeed))
+	}
+	return nil
 }
 
 func spd60(b *Bds60, k KnownState) *float64 {
 	switch {
 	case b.Mach != nil && k.HasAltitude:
-		return f64(*b.Mach * speedOfSound(k.AltitudeFt))
+		return new(*b.Mach * speedOfSound(k.AltitudeFt))
 	case b.IndicatedAirspeed != nil && k.HasAltitude:
-		return f64(casToTas(*b.IndicatedAirspeed, k.AltitudeFt))
+		return new(casToTas(float64(*b.IndicatedAirspeed), k.AltitudeFt))
+	case b.IndicatedAirspeed != nil:
+		return new(float64(*b.IndicatedAirspeed))
 	}
-	return b.IndicatedAirspeed
+	return nil
 }
 
 func vectorDistance(spd, dir *float64, k KnownState) (float64, bool) {

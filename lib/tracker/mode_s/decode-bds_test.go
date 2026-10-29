@@ -178,7 +178,7 @@ func TestCommBRegisters(t *testing.T) {
 				near(t, "track", b.TrueTrack, 346.640625, 1e-9)
 				near(t, "ground speed", b.GroundSpeed, 242, 0)
 				near(t, "track rate", b.TrackRate, -0.125, 1e-9)
-				near(t, "TAS", b.TrueAirspeed, 262, 0)
+				equalInt(t, "TAS", b.TrueAirspeed, 262)
 			}},
 		{bds: BdsEhsTrackTurnReport, support: "decoded", msg: "a00000bf001abb0980000026671f", // only track and ground speed
 			check: func(t *testing.T, f *Frame) {
@@ -199,9 +199,9 @@ func TestCommBRegisters(t *testing.T) {
 			check: func(t *testing.T, f *Frame) {
 				b := f.CommB().B60
 				near(t, "heading", b.MagneticHeading, 63.984375, 1e-9)
-				near(t, "IAS", b.IndicatedAirspeed, 104, 0)
+				equalInt(t, "IAS", b.IndicatedAirspeed, 104)
 				near(t, "Mach", b.Mach, 0.16, 1e-9)
-				near(t, "baro vertical rate", b.BaroVerticalRate, -320, 0)
+				equalInt(t, "baro vertical rate", b.BaroVerticalRate, -320)
 				if b.InertialVerticalRate != nil {
 					t.Errorf("inertial vertical rate %v, not in the message", *b.InertialVerticalRate)
 				}
@@ -359,6 +359,13 @@ func commBFrame(t *testing.T, mb string) *Frame {
 func near(t *testing.T, name string, got *float64, want float64, tol float64) {
 	t.Helper()
 	if got == nil || math.Abs(*got-want) > tol {
+		t.Errorf("%s = %v, want %v", name, got, want)
+	}
+}
+
+func equalInt(t *testing.T, name string, got *int, want int) {
+	t.Helper()
+	if got == nil || *got != want {
 		t.Errorf("%s = %v, want %v", name, got, want)
 	}
 }

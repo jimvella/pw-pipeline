@@ -394,10 +394,10 @@ func TestDecodeTargetStateStatusV2(t *testing.T) {
 		{"8d7c355dea06e898013c006d22f0", 3488, 1019.2, nil, nil, false},
 		{"8d7cac31ea030898013e08126be3", 1504, 1019.2, nil, &modes{}, true},
 		{"8dc04c04ea234890013f08ceb2c2", 18016, 1018.4, nil, &modes{ap: true}, true},
-		{"8d7cad1cea09d89ea13e0401cfc7", 4992, 1019.2, f64(236.25), &modes{lnav: true}, false},
-		{"8f7cad1cea09d89ea13f0cbf50db", 4992, 1019.2, f64(236.25), &modes{ap: true, lnav: true}, true},
-		{"8d7c4a07ea05f89e9d3e84f01711", 3008, 1019.2, f64(234.84375), &modes{vnav: true, lnav: true}, false},
-		{"8d7c4a07ea05f89e9d3f84fe1a91", 3008, 1019.2, f64(234.84375), &modes{ap: true, vnav: true, lnav: true}, false},
+		{"8d7cad1cea09d89ea13e0401cfc7", 4992, 1019.2, new(236.25), &modes{lnav: true}, false},
+		{"8f7cad1cea09d89ea13f0cbf50db", 4992, 1019.2, new(236.25), &modes{ap: true, lnav: true}, true},
+		{"8d7c4a07ea05f89e9d3e84f01711", 3008, 1019.2, new(234.84375), &modes{vnav: true, lnav: true}, false},
+		{"8d7c4a07ea05f89e9d3f84fe1a91", 3008, 1019.2, new(234.84375), &modes{ap: true, vnav: true, lnav: true}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.msg, func(t *testing.T) {

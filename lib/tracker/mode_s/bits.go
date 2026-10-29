@@ -21,3 +21,22 @@ func signedBitsAt(msg []byte, signBit, last int) int64 {
 	}
 	return v
 }
+
+// field reads value bits first..last guarded by status bit `status`. It
+// returns ok=false when the status is clear but the value is not zero, which
+// rules the register out.
+func field(mb []byte, status, first, last int) (raw uint64, present, ok bool) {
+	raw = bitsAt(mb, first, last)
+	if bitsAt(mb, status, status) == 0 {
+		return 0, false, raw == 0
+	}
+	return raw, true, true
+}
+
+// signedField is field with a sign bit at first and magnitude first+1..last.
+func signedField(mb []byte, status, first, last int) (v int64, present, ok bool) {
+	if bitsAt(mb, status, status) == 0 {
+		return 0, false, bitsAt(mb, first, last) == 0
+	}
+	return signedBitsAt(mb, first, last), true, true
+}
