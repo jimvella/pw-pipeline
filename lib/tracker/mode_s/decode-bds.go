@@ -83,11 +83,12 @@ func (f *Frame) decodeCommB() error {
 		}
 	}
 
-	// ErrUnknownCommBMessage means the reply is not an ELS register (1,0, 1,7,
-	// 2,0, 3,0), the only ones that identify themselves. The EHS registers
-	// carry no BDS code, so they can only be recognised by content: status
-	// bits, reserved bits and value ranges. More than one may fit; the
-	// tracker settles that with ResolveCommB.
+	// Not unknown, just not self-identifying: ErrUnknownCommBMessage means
+	// the reply is not one of the ELS registers (1,0, 1,7, 2,0, 3,0), the only
+	// ones that carry their own BDS code. The EHS registers do not, so they
+	// can only be recognised by content: status bits, reserved bits and value
+	// ranges. More than one may fit; the tracker settles that with
+	// ResolveCommB.
 	if errors.Is(err, ErrUnknownCommBMessage) {
 		var alt *int32
 		if f.downLinkFormat == 20 && f.validAltitude && f.unit == modesUnitFeet {
